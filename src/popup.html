@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="popup.css" />
+  <title>Padel Slot Sniper</title>
+</head>
+<body>
+  <header>
+    <h1>🎾 Padel Slot Sniper</h1>
+  </header>
+
+  <label>Ссылка на календарь
+    <input type="url" id="calendarUrl" readonly tabindex="-1" title="Ссылка зафиксирована" />
+  </label>
+  <div class="row">
+    <button id="openCal" class="secondary" type="button">Открыть календарь</button>
+  </div>
+
+  <form id="cfg">
+    <label>Дата
+      <div class="row three">
+        <select id="dd" aria-label="День"></select>
+        <select id="mm" aria-label="Месяц"></select>
+        <select id="yyyy" aria-label="Год"></select>
+      </div>
+    </label>
+
+    <label>Время слота
+      <select id="targetTime">
+        <option value="08:30">8:30am</option>
+        <option value="10:00">10:00am</option>
+        <option value="11:30">11:30am</option>
+        <option value="13:00">1:00pm</option>
+        <option value="14:30">2:30pm</option>
+        <option value="16:00">4:00pm</option>
+        <option value="17:30">5:30pm</option>
+        <option value="19:00">7:00pm</option>
+        <option value="20:30">8:30pm</option>
+      </select>
+    </label>
+
+    <fieldset>
+      <legend>Данные для брони</legend>
+      <div class="row two">
+        <label>Имя
+          <input type="text" id="firstName" autocomplete="off" />
+        </label>
+        <label>Фамилия
+          <input type="text" id="lastName" autocomplete="off" />
+        </label>
+      </div>
+      <label>Email
+        <input type="email" id="email" autocomplete="off" />
+      </label>
+      <label>Номер квартиры / Flat
+        <input type="text" id="flat" autocomplete="off" />
+      </label>
+    </fieldset>
+
+    <label class="check">
+      <input type="checkbox" id="autoBook" checked />
+      Авто-жать «Book» (капча → стоп + уведомление)
+    </label>
+  </form>
+
+  <div class="toggle-wrap">
+    <button id="toggle" class="toggle off" type="button">Включить ожидание</button>
+  </div>
+
+  <div class="row">
+    <button id="bookNow" class="secondary" type="button">Забронировать сейчас</button>
+  </div>
+
+  <div id="status" class="status">Выключено</div>
+
+  <footer>
+    <span>Открой вкладку календаря и держи её открытой.</span>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>
