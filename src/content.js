@@ -2,16 +2,24 @@
 //
 // States (persisted in chrome.storage.local under "state"):
 //   idle  -> do nothing
-//   armed -> poll: every ~1.5s click the calendar (nearest available date) so
-//            the SPA re-fetches + re-renders WITHOUT a reload; intercept the
-//            ListAvailableSlots response (authoritative) + read the grid. When
-//            the target slot opens, grab it immediately on the same page.
+//   armed -> two independent workers:
+//            * replay radar: re-send the captured ListAvailableSlots request
+//              every ~300ms and check each response for the EXACT target slot
+//              (no DOM involved, so detection latency ≈ one server roundtrip);
+//            * view parker: the day strip renders the selected day + the next
+//              6 days, so we park once on the latest available date at/before
+//              the target and never switch days — the target's column is
+//              already on screen when its slots appear, and the grab clicks
+//              them right in the strip. Every ~35s the parker forces one
+//              app-initiated fetch so the replay template's time-bound
+//              credentials (SAPISIDHASH) stay fresh.
+//            Detection is event-driven: every availability response (the app's
+//            own or a replayed one) is checked the moment it arrives.
 //   grab  -> run the booking grab right now (used by "Забронировать сейчас").
 //
-// Why no reload: reloading costs ~3-5s of SPA boot. Instead we drive the app's
-// own fetch by clicking a date, learn "the slot exists" from the intercepted
-// request (not from waiting on render), then click the slot with retries —
-// because the HTML may lag the response and the first click(s) can miss.
+// Why no reload: reloading costs ~3-5s of SPA boot. We learn "the slot exists"
+// from the intercepted/replayed request (not from waiting on render), then
+// click the slot with retries — the HTML may lag the response.
 (function () {
   "use strict";
 
@@ -33,6 +41,7 @@
   var slotWaiters = [];      // resolved by REPLAYED responses only
   var bookingWaiters = [];
   var lastAppSlots = { body: "", ts: 0 }; // latest APP-initiated ListAvailableSlots response
+  var onSlotsBody = null;    // armed-mode hook: called with EVERY availability body on arrival
 
   window.addEventListener("message", function (e) {
     if (e.source !== window) return;
@@ -45,6 +54,7 @@
       } else {
         lastAppSlots = { body: d.body || "", ts: Date.now() };
       }
+      if (onSlotsBody) onSlotsBody(d.body || "");
     } else if (d.type === "booking-result") {
       var b = bookingWaiters; bookingWaiters = [];
       b.forEach(function (fn) { fn(d); });
@@ -234,9 +244,16 @@
   }
   async function closeModal() {
     clickByText(["Cancel", "Cancelar", "Отмена"]);
-    await sleep(350);
+    await sleep(250);
     clickByText(["Discard", "Descartar", "Отменить изменения"]); // "discard unsaved changes" confirm
-    await sleep(300);
+    await sleep(200);
+    if (!dialogEl()) return;
+    // A stuck dialog blocks every later click (parking, slot buttons), so fall
+    // back to Escape rather than leaving the page unusable.
+    document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", keyCode: 27, bubbles: true }));
+    await sleep(250);
+    clickByText(["Discard", "Descartar", "Отменить изменения"]);
+    await sleep(200);
   }
   function bookButton() {
     var btns = dialogScope().querySelectorAll("button");
@@ -282,29 +299,87 @@
     try { chrome.runtime.sendMessage({ type: "notify", title: title, message: message, sound: !!sound }); } catch (e) {}
   }
 
-  // ---------- refresh trigger (drive the app's own fetch, no reload) ----------
-  var refreshIdx = 0;
-  async function triggerAppFetch(td) {
+  // ---------- view parking (keep target slots on screen, no window jumping) ----------
+  // The day strip shows the selected day PLUS the next 6 days, so the target's
+  // column is visible while we stand on an earlier day. We park once on the
+  // latest available date at/before the target and leave the view alone: when
+  // the target's slots open, they render right in the visible strip — no day
+  // switching needed at all. forceRefetch() runs rarely — its only job is to
+  // trigger one app-initiated call so inject.js re-captures the template with
+  // fresh time-bound credentials.
+  var parkedYmd = 0;
+  var maintenanceAsap = false;
+
+  // Available dates ordered by anchoring preference: dates at/before the
+  // target from latest to earliest (each keeps the target inside the 7-day
+  // strip), then dates after the target from earliest to latest.
+  function anchorCells(td) {
     var tn = +ymd(td);
     var avs = availableDateCells();
+    avs.sort(function (a, b) {
+      var ab = a.ymd <= tn, bb = b.ymd <= tn;
+      if (ab !== bb) return ab ? -1 : 1;
+      return ab ? (b.ymd - a.ymd) : (a.ymd - b.ymd);
+    });
+    return avs;
+  }
+
+  async function parkView(td) {
+    var avs = anchorCells(td);
     if (!avs.length) {
       // Nothing bookable in view yet — bounce the month so the app refetches the range.
       var nm = navButton(/next month/i), pm = navButton(/previous month/i);
       if (nm) { nm.click(); await sleep(450); }
       if (pm) { pm.click(); await sleep(450); }
+      parkedYmd = 0;
       return;
     }
-    avs.sort(function (a, b) { return Math.abs(a.ymd - tn) - Math.abs(b.ymd - tn); });
-    // Alternate between the two nearest available dates to bust the SPA cache
-    // (re-selecting the same day may not refetch).
-    var pick = avs[avs.length > 1 ? (refreshIdx++ % 2) : 0];
-    pick.btn.click();
-    if (avs.length === 1) {
-      // Only one clickable day: nudge the day-window to force a fresh fetch.
-      var nd = navButton(/next day/i), pd = navButton(/previous day/i);
-      if (nd) { nd.click(); await sleep(250); }
-      if (pd) { pd.click(); await sleep(250); }
+    if (avs[0].ymd !== parkedYmd) {
+      avs[0].btn.click();
+      parkedYmd = avs[0].ymd;
     }
+  }
+
+  // Trigger one app-initiated ListAvailableSlots (re-selecting the parked day
+  // may be served from the SPA cache, so select something else), then restore
+  // the parked view. The alternate pick is the next-best anchor, so the target
+  // column stays inside the strip even mid-refetch.
+  //
+  // abort() is checked before every click: the grab path watches for the slot
+  // button while this runs, and once the button renders we must stop clicking
+  // dates — a further re-render would detach the element we're about to click.
+  async function forceRefetch(td, abort) {
+    function stopped() { return !!(abort && abort()); }
+    var avs = anchorCells(td);
+    if (!avs.length) { await parkView(td); return; }
+    if (avs.length > 1) {
+      if (stopped()) return;
+      avs[1].btn.click();
+      parkedYmd = 0;              // aborting below must leave the view re-parkable
+      await sleep(500);
+    } else {
+      var nd = navButton(/next day/i), pd = navButton(/previous day/i);
+      if (nd && !stopped()) { nd.click(); await sleep(300); }
+      var pd2 = navButton(/previous day/i) || pd;
+      if (pd2 && !stopped()) { pd2.click(); await sleep(300); }
+    }
+    if (stopped()) return;
+    avs[0].btn.click();
+    parkedYmd = avs[0].ymd;
+  }
+
+  // Open a booking modal once on any available slot and immediately discard it.
+  // First-open cost (lazy modal bundle + reCAPTCHA init) is ~0.5s; paying it
+  // while idle means the real grab clicks into an already-warm dialog.
+  async function prewarmModal(myGen, alive) {
+    if (dialogEl()) return;
+    var all = slotButtonsAll();
+    if (!all.length) return;
+    all[0].click();
+    var f = await waitFor(formIsOpen, 4000, 60);
+    if (!live(myGen) || !alive()) return;
+    if (f) log("booking modal prewarmed");
+    await closeModal();
   }
 
   // ---------- run control ----------
@@ -314,6 +389,9 @@
   function live(myGen) { return myGen === runGen; }
 
   // ---------- polling (armed) ----------
+  var REPLAY_MS = 300;         // replay radar cadence (~3 req/s — fast but not abusive)
+  var MAINTENANCE_MS = 35000;  // how often to force an app fetch (template freshness)
+
   async function startPolling(myGen) {
     var st = await get([CFG_KEY]);
     if (!live(myGen)) return;
@@ -322,56 +400,178 @@
     var timeMin = hhmmToMinutes(cfg.targetTime);
     if (!td || timeMin < 0) { setStatus("Заполни дату и время в popup", "error"); return; }
 
-    setStatus("Жду открытия слота " + cfg.targetDate + " " + cfg.targetTime + " (быстрый режим)…");
+    setStatus("Жду открытия слота " + cfg.targetDate + " " + cfg.targetTime + " (радар " + REPLAY_MS + "мс)…");
 
-    while (live(myGen)) {
-      await ensureMonth(td); if (!live(myGen)) return;
-      await triggerAppFetch(td); if (!live(myGen)) return;   // click calendar -> app fetches + renders
-      await sleep(450); if (!live(myGen)) return;
+    var grabbed = false;
+    // Detection MUST be time-specific: look for the EXACT slot's epoch in the
+    // response. A day-level "date is available" check falsely fires when the
+    // day already has OTHER times open (e.g. 8:30/2:30 exist but 1:00pm doesn't).
+    function tryDetect(bodies) {
+      if (grabbed || !live(myGen)) return false;
+      if (!bodiesContainTarget(bodies, td, timeMin)) return false;
+      grabbed = true;
+      onSlotsBody = null;
+      log("target slot detected in ListAvailableSlots response");
+      grab(td, timeMin, cfg, myGen);
+      return true;
+    }
+    // Event-driven path: every availability response (the app's own or a
+    // replayed one) is checked the moment it arrives, not once per loop turn.
+    onSlotsBody = function (body) { tryDetect([body]); };
 
-      var rep = await replayOnce(2500); if (!live(myGen)) return;
-      // Detection MUST be time-specific: look for the EXACT slot's epoch in the
-      // response. A day-level "date is available" check falsely fires when the
-      // day already has OTHER times open (e.g. 8:30/2:30 exist but 1:00pm doesn't).
-      if (bodiesContainTarget([lastAppSlots.body, rep && rep.body], td, timeMin)) {
-        log("target slot detected in ListAvailableSlots response");
-        await grab(td, timeMin, cfg, myGen);
-        return;
+    // View parker: anchor the strip so the target's column stays on screen.
+    (async function parker() {
+      var notGrabbed = function () { return !grabbed; };
+      var abortOnGrab = function () { return grabbed || !live(myGen); };
+      await ensureMonth(td); if (!live(myGen) || grabbed) return;
+      await parkView(td); if (!live(myGen) || grabbed) return;
+      // Warm the modal now, while nothing is at stake — see prewarmModal().
+      await prewarmModal(myGen, notGrabbed); if (!live(myGen) || grabbed) return;
+      parkedYmd = 0;                        // the prewarm click moved the view
+      var nextMaint = Date.now() + MAINTENANCE_MS;
+      while (live(myGen) && !grabbed) {
+        // Any dialog left open (prewarm, a stray click) would swallow the
+        // clicks below and the slot click when the moment comes.
+        if (dialogEl()) { await closeModal(); if (!live(myGen) || grabbed) return; }
+        await ensureMonth(td); if (!live(myGen) || grabbed) return;
+        if (maintenanceAsap || Date.now() >= nextMaint) {
+          maintenanceAsap = false;
+          nextMaint = Date.now() + MAINTENANCE_MS;
+          await forceRefetch(td, abortOnGrab);
+        } else {
+          await parkView(td);
+        }
+        await sleep(1000);
       }
-      await sleep(150); // fixed ~1s cadence
+    })();
+
+    // Replay radar: ask the server directly, no DOM involved.
+    var fails = 0;
+    while (live(myGen) && !grabbed) {
+      var t0 = Date.now();
+      var rep = await replayOnce(2000);
+      if (!live(myGen) || grabbed) return;
+      if (tryDetect([rep && rep.body, lastAppSlots.body])) return;
+      if (rep && rep.status === 200) {
+        fails = 0;
+      } else if (++fails >= 6) {
+        // ~2s of dead replays: template missing or credentials stale — have
+        // the parker force an app fetch right away to re-capture it.
+        fails = 0;
+        maintenanceAsap = true;
+        setStatus("Радар без ответа — обновляю шаблон запроса…", "warn");
+      }
+      var wait = REPLAY_MS - (Date.now() - t0);
+      if (wait > 0) { await sleep(wait); if (!live(myGen) || grabbed) return; }
     }
   }
 
   // ---------- grab (book on the same page, retry through render lag) ----------
+  // The modal header reads e.g. "Wednesday, July 8, 4:00 – 5:30pm". Once ANY
+  // month name is rendered we can decide target-vs-neighbour immediately
+  // instead of waiting out a fixed grace period.
+  function modalDateRendered() {
+    var d = dialogEl();
+    if (!d) return false;
+    var t = d.textContent || "";
+    for (var i = 0; i < MONTHS.length; i++) if (t.indexOf(MONTHS[i]) !== -1) return true;
+    return false;
+  }
+  // Fill each field the moment it exists rather than waiting for the whole
+  // form: Google renders the name/email/notes inputs in stages.
+  async function fillForm(cfg) {
+    var start = Date.now();
+    var end = start + 1500;
+    var did = { first: false, last: false, mail: false, note: false };
+    while (Date.now() < end) {
+      var f = formInputs();
+      if (!did.first && f.texts[0]) { setNativeValue(f.texts[0], cfg.firstName || ""); did.first = true; }
+      if (!did.last && f.texts[1]) { setNativeValue(f.texts[1], cfg.lastName || ""); did.last = true; }
+      if (!did.mail && f.emails[0]) { setNativeValue(f.emails[0], cfg.email || ""); did.mail = true; }
+      if (!did.note && f.areas[0]) { setNativeValue(f.areas[0], cfg.flat || ""); did.note = true; }
+      if (did.first && did.last && did.mail && did.note) return true;
+      // Last name / notes may simply not exist on this form. Only accept that
+      // after a grace period, or a late-rendering field would go unfilled.
+      if (did.first && did.mail && bookButton() && Date.now() - start > 400) return true;
+      await sleep(40);
+    }
+    return did.first && did.mail;
+  }
+
   async function grab(td, timeMin, cfg, myGen) {
     setStatus("Слот открылся! Бронирую…", "ok");
 
+    // Buttons that already opened a WRONG-day modal. Without this, a same-time
+    // slot on a neighbouring day would be clicked again every iteration
+    // (open modal -> discard -> re-find the same button) until the deadline.
+    // A re-render replaces the elements, so genuinely new buttons still get tried.
+    var tried = [];
+    function freshCandidates() {
+      var c = findSlotButtons(timeMin).filter(function (b) { return tried.indexOf(b) === -1; });
+      return c.length ? c : null;   // null (not []) so waitFor keeps polling
+    }
+
     var opened = false;
+    var filled = false;
+    // An open dialog swallows every click below, so deal with it first. If it
+    // already IS the target's, there's nothing to click — go straight to filling.
+    if (dialogEl()) {
+      if (modalMatchesTarget(td)) {
+        opened = true;
+        setStatus("Заполняю данные…");
+        filled = await fillForm(cfg);
+      } else {
+        await closeModal();
+      }
+      if (!live(myGen)) return;
+    }
     var deadline = Date.now() + 15000;
     while (Date.now() < deadline && !opened) {
       if (!live(myGen)) return;
-      await ensureMonth(td); if (!live(myGen)) return;
-      var cell = dateCellButton(ymd(td));
-      if (cell && isDateAvailable(cell)) {
-        cell.click();                    // select the target day -> its slots render
-        await sleep(450);
-      } else {
-        await triggerAppFetch(td);       // force the app to fetch so the target opens
-        await sleep(650);
-        continue;
+      // The parked strip already shows the target's column, so the slot button
+      // renders in place — no day selection needed. Check what's on screen, then
+      // give the app a brief moment: the radar usually beats the DOM by ~200ms,
+      // and catching that render saves a whole refetch.
+      var cands = freshCandidates() || (await waitFor(freshCandidates, 200, 40)) || [];
+      if (!cands.length && live(myGen)) {
+        // Still not rendered: force an app fetch to redraw the strip — but watch
+        // for the button WHILE it runs, since the redraw usually lands during
+        // the refetch's own pauses. forceRefetch stops clicking once we're set.
+        var seen = null;
+        var refetching = forceRefetch(td, function () { return !!seen || !live(myGen); })
+          .catch(function (e) { log("refetch failed", e); });
+        seen = await waitFor(freshCandidates, 1200, 40);
+        if (!seen) { await refetching; seen = await waitFor(freshCandidates, 400, 40); }
+        cands = seen || [];
+      }
+      if (!cands.length && live(myGen)) {
+        // Nothing at all — the target column may be outside the strip (anchor
+        // more than 6 days away). Select the target day itself as a fallback.
+        await ensureMonth(td); if (!live(myGen)) return;
+        var cell = dateCellButton(ymd(td));
+        if (cell && isDateAvailable(cell)) {
+          cell.click();                  // select the target day -> its slots render
+          cands = (await waitFor(freshCandidates, 1500, 40)) || [];
+        }
       }
       if (!live(myGen)) return;
       // Try each same-time button; verify the modal is actually the target day
       // (the multi-day column view can show the same time on a neighbouring day).
-      var cands = findSlotButtons(timeMin);
       for (var i = 0; i < cands.length; i++) {
         if (!live(myGen)) return;
         cands[i].click();
-        var f = await waitFor(formIsOpen, 3000);
-        if (f && modalMatchesTarget(td)) { opened = true; break; }
-        if (f) { await closeModal(); }   // wrong day -> discard and try the next
+        if (!(await waitFor(modalDateRendered, 2500, 40))) continue;
+        if (!modalMatchesTarget(td)) {    // wrong day -> skip this button from now on
+          tried.push(cands[i]);
+          await closeModal();
+          continue;
+        }
+        opened = true;
+        setStatus("Заполняю данные…");
+        filled = await fillForm(cfg);     // starts as soon as the first input exists
+        break;
       }
-      if (!opened) await sleep(400);
+      if (!opened) await sleep(150);
     }
 
     if (!live(myGen)) return;
@@ -382,14 +582,11 @@
       return;
     }
 
-    setStatus("Заполняю данные…");
-    var form = formIsOpen();
-    if (form.texts[0]) setNativeValue(form.texts[0], cfg.firstName || "");
-    if (form.texts[1]) setNativeValue(form.texts[1], cfg.lastName || "");
-    if (form.emails[0]) setNativeValue(form.emails[0], cfg.email || "");
-    if (form.areas[0]) setNativeValue(form.areas[0], cfg.flat || "");
-    await sleep(350);
-    if (!live(myGen)) return;   // let "Выключить" cancel before we click Book
+    if (!filled) {              // late-rendering inputs: one more pass
+      filled = await fillForm(cfg);
+      if (!live(myGen)) return;
+      if (!filled) { setStatus("Поля формы не заполнились — проверь вкладку", "error"); notify("Padel: заполни форму", "Слот открыт, но поля не заполнились. Открой вкладку.", true); await setState("idle"); return; }
+    }
 
     if (!cfg.autoBook) {
       setStatus("Форма готова — нажми Book вручную", "warn");
