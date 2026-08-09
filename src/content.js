@@ -124,6 +124,19 @@
     }
     return out;
   }
+  // The booking window rolls over at midnight in the COURT's timezone, and that
+  // is when the new day's slots appear. Knowing how far off that is lets us keep
+  // the calendar hot right before it — see the turbo window in startPolling().
+  function msUntilCourtMidnight() {
+    var fmt = new Intl.DateTimeFormat("en-GB", {
+      timeZone: COURT_TZ, hour12: false,
+      hour: "2-digit", minute: "2-digit", second: "2-digit"
+    });
+    var p = {};
+    fmt.formatToParts(new Date()).forEach(function (x) { p[x.type] = x.value; });
+    var secs = ((+p.hour) % 24) * 3600 + (+p.minute) * 60 + (+p.second);
+    return (86400 - secs) * 1000;
+  }
   function bodiesContainTarget(bodies, td, timeMin) {
     var cands = targetEpochCandidates(td, timeMin);
     for (var i = 0; i < bodies.length; i++) {
@@ -368,6 +381,27 @@
     parkedYmd = avs[0].ymd;
   }
 
+  // One click that is guaranteed to change the app's selected day, so it must
+  // refetch and re-render. Alternates target <-> anchor: re-selecting the same
+  // day can be served from the SPA's cache and render nothing.
+  var pokeIdx = 0;
+  function pokeApp(td) {
+    var cells = [];
+    var t = dateCellButton(ymd(td));
+    // Ungated on purpose (same reasoning as in grab): before the rollover the
+    // target still reads "no available times", and that is exactly the day we
+    // need the app to be looking at when the slots land.
+    if (t && !t.disabled && t.getAttribute("aria-disabled") !== "true") cells.push(t);
+    var avs = anchorCells(td);
+    for (var i = 0; i < avs.length && cells.length < 3; i++) {
+      if (avs[i].btn !== t) cells.push(avs[i].btn);
+    }
+    if (!cells.length) return false;
+    cells[pokeIdx++ % cells.length].click();
+    parkedYmd = 0;                  // the view moved; parkView() must re-anchor
+    return true;
+  }
+
   // Open a booking modal once on any available slot and immediately discard it.
   // First-open cost (lazy modal bundle + reCAPTCHA init) is ~0.5s; paying it
   // while idle means the real grab clicks into an already-warm dialog.
@@ -391,6 +425,21 @@
   // ---------- polling (armed) ----------
   var REPLAY_MS = 300;         // replay radar cadence (~3 req/s — fast but not abusive)
   var MAINTENANCE_MS = 35000;  // how often to force an app fetch (template freshness)
+  // Turbo window around the court's midnight rollover. Our replay tells US the
+  // slot exists but leaves the app's own state untouched, so the page still has
+  // to be nudged into redrawing — ~0.5-1s we'd rather not spend after detection.
+  // Instead, for a short window we keep poking the app so IT fetches and renders
+  // the new day by itself; by the time the radar fires, the button is on screen.
+  // The radar halves its rate meanwhile — the app's own responses feed the same
+  // detector, so total request volume stays where it was.
+  var TURBO_LEAD_MS = 25000;   // start before midnight
+  var TURBO_TAIL_MS = 60000;   // keep going after it
+  var TURBO_POKE_MS = 600;     // how often to make the app refetch
+  var TURBO_REPLAY_MS = 600;   // radar cadence while turbo is poking
+  function inTurboWindow() {
+    var left = msUntilCourtMidnight();
+    return left <= TURBO_LEAD_MS || left >= 86400000 - TURBO_TAIL_MS;
+  }
 
   async function startPolling(myGen) {
     var st = await get([CFG_KEY]);
@@ -429,19 +478,35 @@
       await prewarmModal(myGen, notGrabbed); if (!live(myGen) || grabbed) return;
       parkedYmd = 0;                        // the prewarm click moved the view
       var nextMaint = Date.now() + MAINTENANCE_MS;
+      var turboOn = false;
       while (live(myGen) && !grabbed) {
         // Any dialog left open (prewarm, a stray click) would swallow the
         // clicks below and the slot click when the moment comes.
         if (dialogEl()) { await closeModal(); if (!live(myGen) || grabbed) return; }
         await ensureMonth(td); if (!live(myGen) || grabbed) return;
-        if (maintenanceAsap || Date.now() >= nextMaint) {
-          maintenanceAsap = false;
-          nextMaint = Date.now() + MAINTENANCE_MS;
-          await forceRefetch(td, abortOnGrab);
+        if (inTurboWindow()) {
+          // Rollover imminent: keep the app fetching so it renders the new day
+          // on its own — no post-detection redraw to wait out.
+          if (!turboOn) {
+            turboOn = true;
+            setStatus("Полночь близко — держу календарь горячим…");
+          }
+          pokeApp(td);
+          await sleep(TURBO_POKE_MS);
         } else {
-          await parkView(td);
+          if (turboOn) {
+            turboOn = false;
+            setStatus("Жду открытия слота " + cfg.targetDate + " " + cfg.targetTime + "…");
+          }
+          if (maintenanceAsap || Date.now() >= nextMaint) {
+            maintenanceAsap = false;
+            nextMaint = Date.now() + MAINTENANCE_MS;
+            await forceRefetch(td, abortOnGrab);
+          } else {
+            await parkView(td);
+          }
+          await sleep(1000);
         }
-        await sleep(1000);
       }
     })();
 
@@ -461,7 +526,9 @@
         maintenanceAsap = true;
         setStatus("Радар без ответа — обновляю шаблон запроса…", "warn");
       }
-      var wait = REPLAY_MS - (Date.now() - t0);
+      // While turbo pokes the app, its own responses hit the same detector, so
+      // the radar can back off and keep total request volume flat.
+      var wait = (inTurboWindow() ? TURBO_REPLAY_MS : REPLAY_MS) - (Date.now() - t0);
       if (wait > 0) { await sleep(wait); if (!live(myGen) || grabbed) return; }
     }
   }
@@ -531,12 +598,30 @@
       // The parked strip already shows the target's column, so the slot button
       // renders in place — no day selection needed. Check what's on screen, then
       // give the app a brief moment: the radar usually beats the DOM by ~200ms,
-      // and catching that render saves a whole refetch.
-      var cands = freshCandidates() || (await waitFor(freshCandidates, 200, 40)) || [];
+      // and catching that render saves any nudging at all. In the turbo window
+      // the app is already fetching on its own, so this is the usual path.
+      var cands = freshCandidates() || (await waitFor(freshCandidates, 150, 30)) || [];
+
+      // Not rendered yet — the DOM still holds pre-rollover availability.
+      // Selecting the target day is the shortest way to make the app refetch it:
+      // one click, and the day lands as the strip's first column.
+      //
+      // Deliberately NOT gated on isDateAvailable(): that reads the stale
+      // "no available times" label, while the radar has already confirmed
+      // server-side that the slot is open. Trusting the label here would strand
+      // us at exactly the moment the slot opens.
       if (!cands.length && live(myGen)) {
-        // Still not rendered: force an app fetch to redraw the strip — but watch
-        // for the button WHILE it runs, since the redraw usually lands during
-        // the refetch's own pauses. forceRefetch stops clicking once we're set.
+        await ensureMonth(td); if (!live(myGen)) return;
+        var cell = dateCellButton(ymd(td));
+        if (cell && !cell.disabled && cell.getAttribute("aria-disabled") !== "true") {
+          cell.click();
+          cands = (await waitFor(freshCandidates, 700, 40)) || [];
+        }
+      }
+      if (!cands.length && live(myGen)) {
+        // The cell was disabled, or the app served its cache: force a fetch and
+        // watch for the button WHILE it runs, since the redraw usually lands
+        // during the refetch's own pauses. forceRefetch stops once we're set.
         var seen = null;
         var refetching = forceRefetch(td, function () { return !!seen || !live(myGen); })
           .catch(function (e) { log("refetch failed", e); });
@@ -544,23 +629,17 @@
         if (!seen) { await refetching; seen = await waitFor(freshCandidates, 400, 40); }
         cands = seen || [];
       }
-      if (!cands.length && live(myGen)) {
-        // Nothing at all — the target column may be outside the strip (anchor
-        // more than 6 days away). Select the target day itself as a fallback.
-        await ensureMonth(td); if (!live(myGen)) return;
-        var cell = dateCellButton(ymd(td));
-        if (cell && isDateAvailable(cell)) {
-          cell.click();                  // select the target day -> its slots render
-          cands = (await waitFor(freshCandidates, 1500, 40)) || [];
-        }
-      }
       if (!live(myGen)) return;
       // Try each same-time button; verify the modal is actually the target day
       // (the multi-day column view can show the same time on a neighbouring day).
       for (var i = 0; i < cands.length; i++) {
         if (!live(myGen)) return;
         cands[i].click();
-        if (!(await waitFor(modalDateRendered, 2500, 40))) continue;
+        // No dialog at all means the click hit a detached node (a turbo redraw
+        // landed between the query and the click) — retry fast instead of
+        // sitting out the full modal-open patience below.
+        if (!(await waitFor(dialogEl, 800, 30))) continue;
+        if (!(await waitFor(modalDateRendered, 2000, 40))) continue;
         if (!modalMatchesTarget(td)) {    // wrong day -> skip this button from now on
           tried.push(cands[i]);
           await closeModal();
