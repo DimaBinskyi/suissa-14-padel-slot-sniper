@@ -36,6 +36,78 @@ function defaultDate() {
   return { y: String(t.getFullYear()), mo: pad(t.getMonth() + 1), d: pad(t.getDate()) };
 }
 
+// ---- profiles: named sets of booking data (Имя/Фамилия/email/квартира) ----
+// The active profile's values are mirrored into cfg on every edit/switch, so
+// the content script keeps reading cfg exactly as before.
+var profiles = [];
+var activeProfileId = null;
+
+function newProfileId() { return "p" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
+function blankProfile() { return { id: newProfileId(), firstName: "", lastName: "", email: "", flat: "" }; }
+function activeProfile() {
+  for (var i = 0; i < profiles.length; i++) if (profiles[i].id === activeProfileId) return profiles[i];
+  return null;
+}
+function profileLabel(p, idx) {
+  var name = ((p.firstName || "") + " " + (p.lastName || "")).trim();
+  return name || p.email || ("Профиль " + (idx + 1));
+}
+function renderProfileSelect() {
+  var sel = el("profileSelect");
+  while (sel.options.length) sel.remove(0);
+  profiles.forEach(function (p, i) { sel.add(new Option(profileLabel(p, i), p.id)); });
+  sel.value = activeProfileId;
+}
+function fillInfoInputs(p) {
+  INFO.forEach(function (id) { el(id).value = p[id] || ""; });
+}
+function saveProfiles() { return set({ profiles: profiles, activeProfileId: activeProfileId }); }
+
+async function switchProfile() {
+  activeProfileId = el("profileSelect").value;
+  var p = activeProfile();
+  if (p) fillInfoInputs(p);
+  await saveProfiles();
+  await saveCfg();
+}
+
+async function addProfile() {
+  var p = blankProfile();
+  profiles.push(p);
+  activeProfileId = p.id;
+  renderProfileSelect();
+  fillInfoInputs(p);
+  await saveProfiles();
+  await saveCfg();
+  el("firstName").focus();
+}
+
+async function deleteProfile() {
+  var p = activeProfile();
+  if (!p) return;
+  if (!confirm("Удалить профиль «" + profileLabel(p, profiles.indexOf(p)) + "»?")) return;
+  profiles = profiles.filter(function (x) { return x.id !== p.id; });
+  if (!profiles.length) profiles = [blankProfile()];
+  activeProfileId = profiles[0].id;
+  renderProfileSelect();
+  fillInfoInputs(activeProfile());
+  await saveProfiles();
+  await saveCfg();
+}
+
+// Text edits flow into the active profile too, and the option label follows
+// the name as it's typed.
+function onInfoEdit() {
+  var p = activeProfile();
+  if (p) {
+    INFO.forEach(function (id) { p[id] = el(id).value; });
+    var sel = el("profileSelect");
+    if (sel.selectedIndex >= 0) sel.options[sel.selectedIndex].text = profileLabel(p, sel.selectedIndex);
+    saveProfiles();
+  }
+  saveCfg();
+}
+
 function readForm() {
   var cfg = {};
   cfg.calendarUrl = DEFAULT_URL; // fixed, not user-editable
@@ -61,13 +133,31 @@ function applyToggle(state) {
 }
 
 async function restore() {
-  var st = await get(["cfg", "state", "status"]);
+  var st = await get(["cfg", "state", "status", "profiles", "activeProfileId"]);
   var cfg = st.cfg || {};
   el("calendarUrl").value = DEFAULT_URL;
   writeDate(cfg.targetDate);
   if (cfg.targetTime) el("targetTime").value = cfg.targetTime;
-  INFO.forEach(function (id) { if (cfg[id] != null) el(id).value = cfg[id]; });
   el("autoBook").checked = cfg.autoBook !== false;
+
+  profiles = Array.isArray(st.profiles) ? st.profiles : [];
+  activeProfileId = st.activeProfileId;
+  var migrated = false;
+  if (!profiles.length) {
+    // First run with profiles: adopt whatever is already in cfg as profile #1.
+    var p0 = blankProfile();
+    INFO.forEach(function (id) { if (cfg[id] != null) p0[id] = cfg[id]; });
+    profiles = [p0];
+    migrated = true;
+  }
+  if (!activeProfile()) { activeProfileId = profiles[0].id; migrated = true; }
+  renderProfileSelect();
+  fillInfoInputs(activeProfile());
+  if (migrated) await saveProfiles();
+  // cfg stays the booking source of truth — re-sync it if it diverged.
+  var ap = activeProfile();
+  if (INFO.some(function (id) { return (cfg[id] || "") !== (ap[id] || ""); })) await saveCfg();
+
   applyToggle(st.state || "idle");
   applyStatus(st.status, st.state || "idle");
 }
@@ -119,9 +209,12 @@ function init() {
     el(id).addEventListener("change", saveCfg);
   });
   INFO.forEach(function (id) {
-    el(id).addEventListener("input", saveCfg);
-    el(id).addEventListener("change", saveCfg);
+    el(id).addEventListener("input", onInfoEdit);
+    el(id).addEventListener("change", onInfoEdit);
   });
+  el("profileSelect").addEventListener("change", switchProfile);
+  el("profileAdd").addEventListener("click", addProfile);
+  el("profileDel").addEventListener("click", deleteProfile);
   el("openCal").addEventListener("click", openCalendar);
   el("toggle").addEventListener("click", toggle);
   el("bookNow").addEventListener("click", bookNow);

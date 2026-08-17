@@ -37,6 +37,18 @@ input[readonly] { background: #f3f4f6; color: var(--muted); cursor: default; tex
 input[readonly]:focus { outline: none; border-color: var(--line); }
 input:focus, select:focus { outline: 2px solid var(--teal); border-color: var(--teal); }
 .row.two { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.row.profile { display: grid; grid-template-columns: 1fr auto auto; gap: 6px; margin-top: 3px; }
+.row.profile select { margin-top: 0; }
+button.icon {
+  width: 34px;
+  padding: 6px 0;
+  font-size: 15px;
+  background: #f3f4f6;
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+button.icon:hover { background: #e5e7eb; }
 .row.three { display: grid; grid-template-columns: 0.8fr 1.4fr 1fr; gap: 6px; margin-top: 3px; }
 .row.three select { margin-top: 0; }
 fieldset { border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px 2px; margin: 4px 0 10px; }
