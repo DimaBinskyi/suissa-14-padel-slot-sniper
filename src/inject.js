@@ -61,7 +61,8 @@
     post({ type: "booking-captured", ok: true });
   }
 
-  var FIRE_SPIN_MS = 6;   // busy-wait tail that absorbs timer lateness
+  var FIRE_SPIN_MS = 6;       // busy-wait tail that absorbs timer lateness
+  var TOKEN_TTL_MS = 110000;  // reCAPTCHA tokens live ~2min; past that a send is pointless
   // Bumped by every arm-fire and cancel-fire, so a pending timer that is no
   // longer the current intent fires nothing.
   var fireGen = 0;
@@ -282,12 +283,17 @@
         // Disarmed (or re-armed) in the meantime — the content script owns that
         // decision, and a shot nobody asked for would book against the user.
         if (myFireGen !== fireGen) { log("fire[" + ids.join(",") + "] cancelled"); return; }
-        // Machine slept, or the tab was frozen straight through the rollover:
-        // the slot situation is no longer what the request was built for.
-        if (Date.now() > at + 5000) {
-          log("fire skipped: " + (Date.now() - at) + "ms late (tab throttled or machine asleep?)");
+        // Late (throttled tab, machine asleep) is NOT a reason to hold back:
+        // a stale token just gets rejected, while not firing guarantees no
+        // booking. Only give up past the reCAPTCHA TTL, where it cannot work.
+        // Double-booking is not a concern here — a completed booking flips the
+        // state, and every state change sends cancel-fire.
+        var late = Date.now() - at;
+        if (late > TOKEN_TTL_MS) {
+          log("fire skipped: " + (late / 1000).toFixed(1) + "s late, past the token TTL (tab throttled or machine asleep?)");
           return;
         }
+        if (late > 200) log("fire is " + late + "ms LATE — sending anyway");
         // Busy-wait the last few ms: a timer can be late by more than that,
         // and nothing may preempt us between here and the send.
         while (Date.now() < at) { /* spin */ }

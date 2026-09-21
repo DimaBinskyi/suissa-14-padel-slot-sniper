@@ -191,9 +191,13 @@ blocking is asymmetric, though: the shot is ~1 ms of work and never meaningfully
 delays the UI path, and the UI grab only starts after detection (≥ one RTT after
 the rollover), by which time the shots are long gone.
 
-Safety: any state change sends `cancel-fire`, so disarming at 23:59:58 cannot
-leave a booking to go off at midnight, and a fire more than 5 s late (machine
-asleep, tab frozen) is skipped rather than sent against stale availability.
+Safety, biased towards *getting the booking*: any state change sends
+`cancel-fire`, so disarming at 23:59:58 cannot leave a booking to go off at
+midnight. But a **late** fire is still sent — a stale token merely gets
+rejected, while holding back guarantees no booking — and only a send past the
+reCAPTCHA TTL (~110 s, e.g. the machine slept) is abandoned. For the same
+reason a capture is attempted with as little as 7 s left, aborting itself
+(and closing its modal) if the rollover would catch it mid-flight.
 
 ## Reading the logs
 

@@ -648,6 +648,11 @@
   // One thread for everything: hold all DOM work away from the fire moment.
   var FIRE_QUIET_MS = 250;      // turbo poker stands still within this of the send
   var FIRE_BURST_DELAY_MS = 60; // fallback burst waits this long after the send
+  // Least time in which a capture is worth starting. Kept tight on purpose: a
+  // shot is worth far more than a fast fallback, and the capture aborts itself
+  // (closing its modal) if it would otherwise still be open at the rollover.
+  var DIRECT_PREP_MIN_MS = 7000;
+  var CAPTURE_ABORT_MS = 1800;
   var fireAtMs = 0;             // absolute local ms of the planned send
   function inFireQuietWindow() {
     if (!fireAtMs) return false;
@@ -695,6 +700,14 @@
       if (!pMs || !tMs || pMs === tMs) { log("direct prep: bad epochs", pMs, tMs); await closeModal(); return false; }
       if (!(await fillForm(job.data))) { log("direct prep: form did not fill"); await closeModal(); return false; }
       if (!live(myGen) || isGrabbed()) { await closeModal(); return false; }
+      // Point of no return: past here we arm the swallow and wait on the page.
+      // If the rollover is about to land, abandon the capture now so the grid
+      // is clean for the UI path instead of holding a modal open through it.
+      if (msUntilCourtMidnightCorrected() < CAPTURE_ABORT_MS) {
+        log("direct prep: aborting, rollover too close to finish the capture");
+        await closeModal();
+        return false;
+      }
       // Arm the swallow and WAIT for the ack: the Book click below can reach
       // xhr.send synchronously, before an unacked postMessage would arrive —
       // and then the sacrificial slot would get booked for real.
@@ -753,7 +766,7 @@
     for (var i = 0; i < jobs.length; i++) {
       var job = jobs[i];
       if (job.prepared) continue;
-      if (msUntilCourtMidnightCorrected() < 9000) {
+      if (msUntilCourtMidnightCorrected() < DIRECT_PREP_MIN_MS) {
         log("direct prep: not enough time left for " + job.label);
         break;
       }
@@ -911,7 +924,7 @@
         var opensTonight = !!cfg.autoBook && ymd(td) === courtYmdPlus(2);
         var pending = jobs.some(function (j) { return !j.prepared; });
         if (opensTonight && pending && directCtl.attempts < 2 &&
-            leftMs <= prepLead && leftMs > 9000) {
+            leftMs <= prepLead && leftMs > DIRECT_PREP_MIN_MS) {
           directCtl.attempts++;
           await prepareDirectShots(td, jobs, cfg, myGen, function () { return grabbed; });
           if (!live(myGen) || grabbed) return;
