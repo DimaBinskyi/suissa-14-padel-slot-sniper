@@ -7,7 +7,7 @@
 //            booking request (with its fresh reCAPTCHA token) ~75s before
 //            server-corrected midnight, retargets it to the wanted slot, and
 //            fires it ~120ms after the rollover — one RTT instead of the ~0.5s
-//            UI path. The UI grab stays armed as a gated fallback.
+//            UI path. The UI grab runs independently in parallel.
 //   armed -> two independent workers:
 //            * replay radar: re-send the captured ListAvailableSlots request
 //              every ~300ms and check each response for the EXACT target slot
@@ -548,14 +548,13 @@
   // click, so the page mints its own reCAPTCHA token), swallow it before it
   // reaches the network, rewrite the slot epochs to the target, and fire it at
   // corrected midnight — the booking arrives one RTT after the rollover. The
-  // UI grab keeps running as a fallback, gated so both can never book at once.
-  var directGatePromise = null, directGateResolve = null;
-  function armDirectGate() {
-    directGatePromise = new Promise(function (r) { directGateResolve = r; });
-  }
-  function resolveDirectGate(v) {
-    if (directGateResolve) { directGateResolve(v); directGateResolve = null; }
-  }
+  // UI grab runs fully INDEPENDENTLY in parallel: neither path waits on the
+  // other. If both land, the worst case is a duplicate booking to cancel by
+  // hand — losing the slot costs more than an extra cancellation.
+  //
+  // Set when the direct shot booked the slot; the UI grab uses it only to
+  // label its own outcome correctly (our own booking is not a rival's).
+  var directWon = false;
 
   async function prepareDirectBooking(td, timeMin, cfg, myGen, isGrabbed) {
     try {
@@ -628,15 +627,12 @@
   }
 
   async function scheduleMidnightFire(td, timeMin, cfg, myGen, ctl, isGrabbed) {
-    // Arm the gate BEFORE the spin: a grab triggered in the first ms after
-    // rollover must find it and wait for the shot's outcome, not race past it.
-    if (ctl.prepared) armDirectGate();
     var fireAt = Date.now() + msUntilCourtMidnightCorrected() + DIRECT_SEND_DELAY_MS;
     while (Date.now() < fireAt) {
-      if (!live(myGen) || isGrabbed()) { resolveDirectGate("lost"); return; }
+      if (!live(myGen) || isGrabbed()) return;
       await sleep(Math.min(40, Math.max(4, fireAt - Date.now())));
     }
-    if (!live(myGen)) { resolveDirectGate("lost"); return; }
+    if (!live(myGen)) return;
     // The shot goes out first — every ms counts — then the fallback burst:
     // select the target day so the app fetches/renders it, and give the radar
     // immediate samples instead of waiting out its cadence.
@@ -654,10 +650,8 @@
     }
     if (!resP) return;
     var res = await resP;
-    if (!live(myGen)) { resolveDirectGate("lost"); return; }
+    if (!live(myGen)) return;
     if (!(res && res.status === 200)) {
-      // Fail fast: release the UI grab immediately, don't spend its head start.
-      resolveDirectGate("lost");
       log("direct shot failed (status " + (res && res.status) + " " + (res && res.error || "") + ") — UI grab continues");
       // If the slot is ALSO gone from availability, a rival got it — say so.
       await sleep(1500);
@@ -675,12 +669,13 @@
     var chk = await replayOnce(1600);
     var won = !(chk && chk.body && bodiesContainTarget([chk.body], td, timeMin));
     if (won) {
-      resolveDirectGate("won");
+      directWon = true;
       setStatus("✅ Слот " + cfg.targetTime + " забронирован прямым запросом!", "ok");
       notify("✅ Padel забронирован", "Слот " + cfg.targetDate + " " + cfg.targetTime + " занят прямым запросом. Проверь почту.", true);
-      await setState("idle");
+      // Don't kill a UI grab mid-flight — it runs independently and reports
+      // its own outcome. Only disarm when nothing else is booking.
+      if (!isGrabbed()) await setState("idle");
     } else {
-      resolveDirectGate("lost");
       log("direct shot got 200 but the slot is still open — UI grab continues");
     }
   }
@@ -693,8 +688,7 @@
     var timeMin = hhmmToMinutes(cfg.targetTime);
     if (!td || timeMin < 0) { setStatus("Заполни дату и время в popup", "error"); return; }
 
-    directGatePromise = null;
-    directGateResolve = null;
+    directWon = false;
     setStatus("Жду открытия слота " + cfg.targetDate + " " + cfg.targetTime + " (радар " + REPLAY_MS + "мс)…");
 
     var grabbed = false;
@@ -942,14 +936,6 @@
       return;
     }
 
-    // If the direct shot is in flight, ITS outcome decides — clicking Book here
-    // too could double-book. Wait briefly; on timeout assume it lost and go.
-    if (directGatePromise) {
-      var dg = await Promise.race([directGatePromise, sleep(2200).then(function () { return null; })]);
-      if (!live(myGen)) return;
-      if (dg === "won") { await closeModal(); return; }
-    }
-
     var book = bookButton();
     if (!book) { setStatus("Кнопка Book не найдена — стоп", "error"); await setState("idle"); return; }
 
@@ -974,8 +960,13 @@
       return;
     }
     if (outcome && outcome.kind === "taken") {
-      setStatus("Слот перехватили раньше нас", "error");
-      notify("Padel: слот перехвачен", "Кто-то успел забронировать " + cfg.targetTime + " первым.", true);
+      if (directWon) {
+        // "Taken" by ourselves: the direct shot landed first. Not an error.
+        setStatus("✅ Слот уже забронирован прямым запросом", "ok");
+      } else {
+        setStatus("Слот перехватили раньше нас", "error");
+        notify("Padel: слот перехвачен", "Кто-то успел забронировать " + cfg.targetTime + " первым.", true);
+      }
       await setState("idle");
       return;
     }
@@ -984,6 +975,10 @@
     if (ok) {
       setStatus("✅ Слот " + cfg.targetTime + " забронирован!", "ok");
       notify("✅ Padel забронирован", "Слот " + cfg.targetDate + " " + cfg.targetTime + " успешно занят.", true);
+      await setState("idle");
+    } else if (directWon) {
+      // The UI attempt fizzled, but the direct shot already secured the slot.
+      setStatus("✅ Слот уже забронирован прямым запросом", "ok");
       await setState("idle");
     } else {
       setStatus("Не удалось подтвердить бронь — проверь вкладку", "error");

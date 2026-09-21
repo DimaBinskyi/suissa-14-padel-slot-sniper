@@ -70,10 +70,12 @@ target date opens (and only with auto-Book on), a third worker now runs:
 4. **Fire (T+120 ms after corrected midnight)** — send the prepared request
    via `fetch`. The booking reaches Google one RTT after the rollover instead
    of ~0.6 s. Simultaneously the target day is clicked and a replay burst
-   feeds the radar, so the classic UI grab runs as **fallback**, gated on the
-   shot's outcome so both can never book at once. A 200 is only trusted after
-   a follow-up availability check confirms the slot is gone; on any failure
-   the UI grab proceeds immediately, and if the slot is gone from availability
+   feeds the radar, so the classic UI grab runs **independently in parallel**
+   — neither path ever waits on the other. If both land, the worst case is a
+   duplicate booking to cancel by hand. A 200 is only trusted after a
+   follow-up availability check confirms the slot is gone; if the direct shot
+   booked first, the UI path labels its outcome "уже забронирован прямым
+   запросом" instead of treating the slot as stolen, and if a rival got it
    you get a "перехвачен" notification instead of a silent hang.
 
 Caveats needing one live pass: the booking RPC body format (epoch replacement
