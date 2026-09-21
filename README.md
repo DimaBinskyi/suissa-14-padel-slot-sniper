@@ -95,10 +95,21 @@ The two paths scale very differently, which is the whole point:
   capture lead back by 12 s — `T−20 s` for one slot, `T−32 s` for two. Only the
   first token pays the full wait. At the rollover **both requests leave in the
   same tick**, so both bookings land ~one RTT after midnight.
-- **UI fallback — sequential.** One modal at a time: the first slot lands at
-  ~T+0.6 s, the second at ~T+2.5 s. Between jobs it returns to the grid
-  (dismiss dialog → *Done*/*Close* → wait for slot buttons); if the
-  confirmation view can't be dismissed it tells you to finish that one by hand.
+- **UI fallback — overlapped.** One modal at a time, but a job hands off as
+  soon as its request is **sent** rather than when it completes, so the next
+  slot's modal opens ~1 s earlier: first slot ~T+0.6 s, second ~T+1.6 s
+  (measured on the live page: a stacked modal renders 220 ms after the click).
+  The handed-off job's result is collected in the background by its request's
+  sequence number and reported when it lands.
+
+  This works because of two things measured on the live page: clicking a second
+  slot **stacks** a new `[role=dialog]` rather than swapping the existing one,
+  and after the send nothing done to the DOM can undo the booking. It
+  deliberately does *not* close the first modal — `Cancel` is `disabled` while
+  a booking submits, so closing mid-flight is impossible anyway. If no send is
+  observed within 4 s it falls back to waiting for the full outcome, so the
+  handoff can never be slower than not having it. The last job in the queue
+  always waits normally; there is nothing left to overlap with.
 
 Jobs the direct shot already won are skipped by the UI queue, and a modal left
 open by the other slot is never filled in for the wrong job — the 90-minute end

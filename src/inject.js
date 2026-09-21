@@ -61,6 +61,7 @@
     post({ type: "booking-captured", ok: true });
   }
 
+  var bookSeq = 0;            // correlates booking-sent with booking-result
   var FIRE_SPIN_MS = 6;       // busy-wait tail that absorbs timer lateness
   var TOKEN_TTL_MS = 110000;  // reCAPTCHA tokens live ~2min; past that a send is pointless
   // Bumped by every arm-fire and cancel-fire, so a pending timer that is no
@@ -195,20 +196,29 @@
       // sentAt lets the content script ignore a booking result belonging to a
       // request that was already in flight before it started waiting — without
       // it, one job's response resolves the next job's wait and reports a
-      // booking that never happened.
+      // booking that never happened. seq correlates a result with the exact
+      // send it came from, which is what lets the booking queue move on as
+      // soon as a request is in flight.
       var sentAt = Date.now();
+      var seq = (kind === "book") ? ++bookSeq : 0;
+      if (kind === "book") {
+        // The page has handed this request to the network stack: it can no
+        // longer be called back, so whatever happens to the DOM from here on
+        // cannot undo the booking.
+        post({ type: "booking-sent", seq: seq, sentAt: sentAt });
+      }
       this.addEventListener("load", function () {
         var text = "";
         try { text = self.responseText || ""; } catch (e) { /* opaque */ }
         if (kind === "slots") {
           post({ type: "slots", status: self.status, body: text, replayed: false });
         } else {
-          post({ type: "booking-result", status: self.status, body: text.slice(0, 800), sentAt: sentAt });
+          post({ type: "booking-result", seq: seq, status: self.status, body: text.slice(0, 800), sentAt: sentAt });
         }
       });
       this.addEventListener("error", function () {
         if (kind === "slots") post({ type: "slots", status: 0, body: "", error: "xhr-error" });
-        else post({ type: "booking-result", status: 0, body: "", error: "xhr-error", sentAt: sentAt });
+        else post({ type: "booking-result", seq: seq, status: 0, body: "", error: "xhr-error", sentAt: sentAt });
       });
     }
     return XS.apply(this, arguments);

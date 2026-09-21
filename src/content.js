@@ -63,6 +63,8 @@
   // ---------- inject bridge ----------
   var slotWaiters = [];      // resolved by REPLAYED responses only
   var bookingWaiters = [];
+  var sentWaiters = [];      // resolved when the page's booking request goes out
+  var bookingResults = {};   // seq -> result, for a reply that beats its waiter
   var captureWaiters = [];   // resolved when inject captures a booking template
   var suppressWaiters = [];  // resolved when inject acks suppress-booking-on
   var preparedWaiters = [];  // resolved when inject finishes prepare-direct
@@ -100,7 +102,12 @@
         log("clock probe returned no Date header (" + (d.error || "status " + d.status) +
             ") — scheduling on the LOCAL clock");
       }
+    } else if (d.type === "booking-sent") {
+      flushWaiters(sentWaiters, d);
     } else if (d.type === "booking-result") {
+      // Cache by seq: a handed-off job asks for its result only after the send
+      // is announced, and a fast reply can land in between.
+      if (d.seq) bookingResults[d.seq] = d;
       flushWaiters(bookingWaiters, d);
     } else if (d.type === "booking-captured") {
       flushWaiters(captureWaiters, d);
@@ -148,6 +155,31 @@
       });
       toInject({ cmd: "replay", rid: rid });
     });
+  }
+  // Resolves the moment the page hands its booking request to the network
+  // stack. From then on the booking cannot be called back, so the queue is free
+  // to open the next slot's modal — which is ~1s earlier than waiting for the
+  // response. Carries the seq to look the matching result up with.
+  function nextBookingSent(timeoutMs) {
+    var since = Date.now();
+    return new Promise(function (res) {
+      var done = false;
+      var t = setTimeout(function () { if (!done) { done = true; res(null); } }, timeoutMs || 4000);
+      sentWaiters.push({
+        pred: function (d) { return !d || d.sentAt == null || d.sentAt >= since - 50; },
+        fn: function (d) { if (!done) { done = true; clearTimeout(t); res(d); } }
+      });
+    });
+  }
+  // Exact correlation by seq — no fence heuristics, so a handed-off job's
+  // result can never be confused with the next job's.
+  function bookingResultFor(seq, timeoutMs) {
+    if (bookingResults[seq]) {
+      var cached = bookingResults[seq];
+      delete bookingResults[seq];
+      return Promise.resolve(cached);
+    }
+    return awaitMsg(bookingWaiters, timeoutMs || 20000, null, function (d) { return d && d.seq === seq; });
   }
   // Only accept a booking result for a request the page sent AFTER we started
   // waiting. One job's late response would otherwise resolve the next job's
@@ -1223,7 +1255,8 @@
   // Book ONE job through the UI. Returns an outcome string; the caller owns
   // status/notifications/state so a queue of jobs can be reported as a whole:
   //   ok | captcha | taken | manual | unrendered | noform | unconfirmed | aborted
-  async function grabJob(td, job, cfg, myGen) {
+  async function grabJob(td, job, cfg, myGen, opts) {
+    opts = opts || {};
     var timeMin = job.timeMin;
     setStatus("Слот " + job.label + " открылся! Бронирую…", "ok");
     // Belt & suspenders: never run the real booking through a swallowed hook.
@@ -1246,9 +1279,10 @@
 
     var opened = false;
     var filled = false;
-    // An open dialog swallows every click below, so deal with it first. If it
-    // already IS this job's, there's nothing to click — go straight to filling.
-    if (dialogEl()) {
+    // With expectStacked, the dialog on screen belongs to the PREVIOUS job and
+    // is still submitting — leave it alone. Its Cancel is disabled anyway, and
+    // clicking our slot simply stacks a new dialog on top of it.
+    if (dialogEl() && !opts.expectStacked) {
       if (modalIsThisJob()) {
         opened = true;
         setStatus("Заполняю данные…");
@@ -1300,11 +1334,18 @@
       // (the multi-day column view can show the same time on a neighbouring day).
       for (var i = 0; i < cands.length; i++) {
         if (!live(myGen)) return "aborted";
+        // Wait for a dialog that was not already on screen. Dialogs stack, so
+        // "is there a dialog" would be satisfied instantly by the previous
+        // job's — and we would then validate and fill the wrong one.
+        var priorDialogs = [].slice.call(document.querySelectorAll('[role="dialog"]'));
         cands[i].click();
-        // No dialog at all means the click hit a detached node (a turbo redraw
+        // No new dialog means the click hit a detached node (a turbo redraw
         // landed between the query and the click) — retry fast instead of
         // sitting out the full modal-open patience below.
-        if (!(await waitFor(dialogEl, 800, 30))) continue;
+        if (!(await waitFor(function () {
+          var d = dialogEl();
+          return (d && priorDialogs.indexOf(d) === -1) ? d : null;
+        }, 1500, 30))) continue;
         if (!(await waitFor(modalDateRendered, 2000, 40))) continue;
         if (!modalIsThisJob()) {          // wrong day/time -> skip this button
           tried.push(cands[i]);
@@ -1336,10 +1377,33 @@
     if (!book) return "nobutton";
 
     setStatus("Жму Book…");
+    var sentP = opts.handoff ? nextBookingSent(4000) : null;
     var resultP = nextBookingResult(20000);
     var clickedAt = Date.now();
     book.click();
     log("Book clicked for " + job.label);
+
+    // Fast handoff: stop waiting once the request is provably in flight and let
+    // the queue open the next slot ~1s sooner. Only the SEND is waited for —
+    // never the response — because after the send nothing we do to the DOM can
+    // undo the booking. A captcha challenge still stops everything, and if no
+    // send is observed we fall through to the full wait, so this can never be
+    // slower than not having it.
+    if (sentP) {
+      var s = await Promise.race([
+        sentP.then(function (d) { return d ? { sent: d } : null; }),
+        waitFor(captchaVisible, 4000, 250).then(function (v) { return v ? { captcha: true } : null; })
+      ]);
+      if (!live(myGen)) return "aborted";
+      if (s && s.captcha) return "captcha";
+      if (s && s.sent) {
+        log("handoff: " + job.label + " is in flight after " + (Date.now() - clickedAt) +
+            "ms (seq " + s.sent.seq + ") — queue moves on");
+        opts.handoff(job, bookingResultFor(s.sent.seq, 20000));
+        return "sent";
+      }
+      log("handoff: no send seen for " + job.label + " within 4s — waiting for the outcome as usual");
+    }
 
     var outcome = await Promise.race([
       resultP.then(function (r) { return { kind: "rpc", data: r }; }),
@@ -1445,12 +1509,30 @@
     });
     log("UI booking queue starts: " + jobTimes(queue) + " on " + cfg.targetDate +
         (detected && detected.length ? " (detected: " + jobTimes(detected) + ")" : ""));
+
+    // Jobs handed off mid-flight: their result lands after the queue has moved
+    // on, so collect the promises and settle them before reporting totals.
+    var handoffs = [];
+    function handoff(hjob, resultPromise) {
+      handoffs.push(resultPromise.then(function (r) {
+        var ok = !!(r && r.status === 200);
+        hjob.out = ok ? "ok" : "unconfirmed";
+        hjob.ok = ok;
+        log("handoff result for " + hjob.label + ": http=" + ((r && r.status) || "timeout") +
+            ((r && r.body) ? " body=" + String(r.body).slice(0, 160) : ""));
+        reportJob(hjob, hjob.out, cfg);
+      }));
+    }
+
+    var prevHandedOff = false;
     for (var i = 0; i < queue.length; i++) {
       var job = queue[i];
       if (!live(myGen)) return;
       if (job.done) continue;
       if (job.directWon) { log("skip " + job.label + " — already won by the direct shot"); job.done = true; job.ok = true; continue; }
-      if (did > 0 && !(await backToGrid(myGen))) {
+      // Only return to the grid when the previous job actually finished. After
+      // a handoff its dialog is deliberately left open and ours stacks on top.
+      if (did > 0 && !prevHandedOff && !(await backToGrid(myGen))) {
         if (!live(myGen)) return;
         log("could not get back to the slot grid before " + job.label);
         job.done = true;
@@ -1458,9 +1540,17 @@
         notify("Padel: добей вручную", "Слот " + job.time + " не забронирован — открой вкладку.", true);
         continue;
       }
-      var out = await grabJob(td, job, cfg, myGen);
+      // Hand off every job except the last: there is nothing left to overlap
+      // with after it, so the last one waits and reports normally.
+      var isLast = (i === queue.length - 1);
+      var out = await grabJob(td, job, cfg, myGen, {
+        handoff: isLast ? null : handoff,
+        expectStacked: prevHandedOff
+      });
       if (!live(myGen) || out === "aborted") return;
       did++;
+      prevHandedOff = (out === "sent");
+      if (out === "sent") { job.done = true; continue; }   // reported by its handoff
       job.done = true;
       job.out = out;
       job.ok = (out === "ok");
@@ -1472,6 +1562,11 @@
       }
     }
     if (!live(myGen)) return;
+    if (handoffs.length) {
+      log("waiting for " + handoffs.length + " handed-off booking(s) to report");
+      await Promise.all(handoffs);
+      if (!live(myGen)) return;
+    }
     var okJobs = jobs.filter(function (j) { return j.ok || j.directWon; });
     if (jobs.length > 1) {
       setStatus(okJobs.length === jobs.length
