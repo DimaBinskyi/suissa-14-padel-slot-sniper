@@ -32,15 +32,33 @@
   var CFG_KEY = "cfg";
   var STATE_KEY = "state";
 
+  // Every event goes to console.log with a ms-resolution stamp and, once the
+  // clock is synced, the signed offset to the court's midnight (T-12.3s /
+  // T+0.150s). That offset is the number that matters when tuning the shot, so
+  // it belongs on every line rather than in a separate countdown log.
+  function stamp() {
+    var d = new Date();
+    return d.toTimeString().slice(0, 8) + "." + ("00" + d.getMilliseconds()).slice(-3);
+  }
+  function tOffset() {
+    if (!clockOffsets.length) return "";
+    var left = msUntilCourtMidnightCorrected();
+    if (left > 86400000 - 120000) return " T+" + ((86400000 - left) / 1000).toFixed(3) + "s";
+    if (left < 120000) return " T-" + (left / 1000).toFixed(3) + "s";
+    return "";
+  }
   var log = function () {
-    var a = ["[padel]"].concat([].slice.call(arguments));
+    var a = ["[padel " + stamp() + tOffset() + "]"].concat([].slice.call(arguments));
     console.log.apply(console, a);
   };
 
   // ---------- storage ----------
   function get(keys) { return new Promise(function (res) { chrome.storage.local.get(keys, res); }); }
   function set(obj) { return new Promise(function (res) { chrome.storage.local.set(obj, res); }); }
-  function setStatus(text, level) { set({ status: { text: text, level: level || "info", ts: Date.now() } }); log(text); }
+  function setStatus(text, level) {
+    set({ status: { text: text, level: level || "info", ts: Date.now() } });
+    log("status[" + (level || "info") + "]", text);
+  }
   function setState(s) { return set({ state: s }); }
 
   // ---------- inject bridge ----------
@@ -189,6 +207,7 @@
   // offset = serverNow - localNow, good to a few hundred ms — enough to
   // SCHEDULE the midnight shot instead of discovering the rollover by polling.
   var clockOffsets = [];
+  var lastLoggedOffset = null;
   function noteClockSample(dateHeader, tSent, tRecv) {
     var s = Date.parse(dateHeader || "");
     if (!s || !tSent || !tRecv) return;
@@ -196,6 +215,14 @@
     if (rtt < 0 || rtt > 2000) return; // stalled request — poisoned sample
     clockOffsets.push((s + 500) - (tSent + tRecv) / 2);
     if (clockOffsets.length > 15) clockOffsets.shift();
+    // Log the first fix and any material drift; a per-sample log would be 3/s.
+    var off = clockOffset();
+    if (lastLoggedOffset === null || Math.abs(off - lastLoggedOffset) > 150) {
+      lastLoggedOffset = off;
+      log("clock sync: server offset " + (off >= 0 ? "+" : "") + Math.round(off) + "ms" +
+          " (rtt " + rtt + "ms, " + clockOffsets.length + " samples), midnight in " +
+          (msUntilCourtMidnightCorrected() / 1000).toFixed(1) + "s");
+    }
   }
   function clockOffset() {
     if (!clockOffsets.length) return 0;
@@ -428,7 +455,10 @@
     return /you'?re booked|booking confirmed|reserva confirmada|has reservado|cita reservada|added to your calendar/.test(body);
   }
   function notify(title, message, sound) {
-    try { chrome.runtime.sendMessage({ type: "notify", title: title, message: message, sound: !!sound }); } catch (e) {}
+    log("notify:", title, "|", message);
+    try { chrome.runtime.sendMessage({ type: "notify", title: title, message: message, sound: !!sound }); } catch (e) {
+      log("notify FAILED (service worker gone?)", String(e));
+    }
   }
 
   // ---------- view parking (keep target slots on screen, no window jumping) ----------
@@ -709,21 +739,32 @@
 
   async function scheduleMidnightFire(td, jobs, cfg, myGen, isGrabbed) {
     var fireAt = Date.now() + msUntilCourtMidnightCorrected() + DIRECT_SEND_DELAY_MS;
+    log("midnight fire scheduled in " + (fireAt - Date.now()) + "ms " +
+        "(clock offset " + Math.round(clockOffset()) + "ms, send delay " + DIRECT_SEND_DELAY_MS + "ms), armed jobs: " +
+        (jobTimes(jobs.filter(function (j) { return j.prepared; })) || "none"));
     while (Date.now() < fireAt) {
-      if (!live(myGen) || isGrabbed()) return;
+      if (!live(myGen) || isGrabbed()) { log("fire cancelled before midnight (grab already running or disarmed)"); return; }
       await sleep(Math.min(40, Math.max(4, fireAt - Date.now())));
     }
     if (!live(myGen)) return;
+    log("FIRE (scheduled drift " + (Date.now() - fireAt) + "ms)");
     // The shots go out first — every ms counts — then the fallback burst:
     // select the target day so the app fetches/renders it, and give the radar
     // immediate samples instead of waiting out its cadence.
     var armed = jobs.filter(function (j) { return j.prepared; });
+    var sentAt = Date.now();
     var shots = armed.map(function (j) {
       // All shots leave in the same tick: two slots are booked truly in
       // parallel, each arriving one RTT after the rollover.
       return awaitMsg(directWaiters, 4000, function () {
+        log("direct-book sent for " + j.label);
         toInject({ cmd: "direct-book", id: j.id });
-      }, byId(j.id)).then(function (res) { return { job: j, res: res }; });
+      }, byId(j.id)).then(function (res) {
+        log("direct-book result for " + j.label + ": status " + ((res && res.status) || "timeout") +
+            " after " + (Date.now() - sentAt) + "ms" + ((res && res.error) ? " error=" + res.error : "") +
+            ((res && res.body) ? " body=" + String(res.body).slice(0, 200) : ""));
+        return { job: j, res: res };
+      });
     });
     if (armed.length) {
       setStatus(armed.length > 1
@@ -755,6 +796,8 @@
     var wonJobs = [], lostJobs = [];
     settled.forEach(function (s) {
       var gone = !(body && bodiesContainTarget([body], td, s.job.timeMin));
+      log("verify " + s.job.label + ": http=" + ((s.res && s.res.status) || 0) +
+          " slotStillOpen=" + (!gone) + " -> " + (s.res && s.res.status === 200 && gone ? "WON" : "not won"));
       if (s.res && s.res.status === 200 && gone) { s.job.directWon = true; wonJobs.push(s.job); }
       else lostJobs.push(s.job);
     });
@@ -876,10 +919,27 @@
 
     // Replay radar: ask the server directly, no DOM involved.
     var fails = 0;
+    var beat = { n: 0, ok: 0, since: Date.now(), lastStatus: 0 };
     while (live(myGen) && !grabbed) {
       var t0 = Date.now();
       var rep = await replayOnce(2000);
       if (!live(myGen) || grabbed) return;
+      // Radar runs ~3x/s for hours, so per-request logging is a heartbeat
+      // outside the rollover window and full detail inside it, where every
+      // response is worth seeing.
+      beat.n++;
+      beat.lastStatus = (rep && rep.status) || 0;
+      if (beat.lastStatus === 200) beat.ok++;
+      if (inTurboWindow()) {
+        log("radar replay: status " + beat.lastStatus + ", " + ((rep && rep.body) || "").length +
+            "b, target " + (bodiesContainTarget([rep && rep.body], td, jobs[0].timeMin) ? "PRESENT" : "absent") +
+            ", " + (Date.now() - t0) + "ms");
+      } else if (Date.now() - beat.since >= 10000) {
+        log("radar heartbeat: " + beat.ok + "/" + beat.n + " ok in " +
+            ((Date.now() - beat.since) / 1000).toFixed(0) + "s, midnight in " +
+            (msUntilCourtMidnightCorrected() / 1000).toFixed(0) + "s");
+        beat = { n: 0, ok: 0, since: Date.now(), lastStatus: beat.lastStatus };
+      }
       if (tryDetect([rep && rep.body, lastAppSlots.body])) return;
       if (rep && rep.status === 200) {
         fails = 0;
@@ -1022,7 +1082,9 @@
         }
         opened = true;
         setStatus("Заполняю данные…");
+        log("modal open for " + job.label + " (candidate " + (i + 1) + "/" + cands.length + ")");
         filled = await fillForm(job.data);  // starts as soon as the first input exists
+        log("form filled=" + filled + " for <" + job.data.email + "> кв." + job.data.flat);
         break;
       }
       if (!opened) await sleep(150);
@@ -1044,7 +1106,9 @@
 
     setStatus("Жму Book…");
     var resultP = nextBookingResult(20000);
+    var clickedAt = Date.now();
     book.click();
+    log("Book clicked for " + job.label);
 
     var outcome = await Promise.race([
       resultP.then(function (r) { return { kind: "rpc", data: r }; }),
@@ -1056,6 +1120,10 @@
       if (captchaVisible()) outcome = { kind: "captcha" };
     }
 
+    log("Book outcome for " + job.label + ": " + ((outcome && outcome.kind) || "nothing") +
+        (outcome && outcome.kind === "rpc" ? " http=" + ((outcome.data && outcome.data.status) || 0) +
+          ((outcome.data && outcome.data.body) ? " body=" + String(outcome.data.body).slice(0, 200) : "") : "") +
+        " after " + (Date.now() - clickedAt) + "ms");
     if (outcome && outcome.kind === "captcha") return "captcha";
     if (outcome && outcome.kind === "taken") return "taken";
     var ok = (outcome && outcome.kind === "confirmed") ||
@@ -1116,13 +1184,15 @@
   // bookings cannot overlap. Jobs already won by a direct shot are skipped.
   async function runGrabs(td, jobs, cfg, myGen) {
     var did = 0;
+    log("UI booking queue starts: " + jobTimes(jobs) + " on " + cfg.targetDate);
     for (var i = 0; i < jobs.length; i++) {
       var job = jobs[i];
       if (!live(myGen)) return;
       if (job.done) continue;
-      if (job.directWon) { job.done = true; job.ok = true; continue; }
+      if (job.directWon) { log("skip " + job.label + " — already won by the direct shot"); job.done = true; job.ok = true; continue; }
       if (did > 0 && !(await backToGrid(myGen))) {
         if (!live(myGen)) return;
+        log("could not get back to the slot grid before " + job.label);
         job.done = true;
         setStatus("Не удалось вернуться к сетке — забронируй " + job.label + " вручную", "error");
         notify("Padel: добей вручную", "Слот " + job.time + " не забронирован — открой вкладку.", true);
@@ -1136,7 +1206,10 @@
       job.ok = (out === "ok");
       reportJob(job, out, cfg);
       // A captcha challenge or a half-filled form blocks everything behind it.
-      if (out === "captcha" || out === "manual" || out === "noform" || out === "nobutton") break;
+      if (out === "captcha" || out === "manual" || out === "noform" || out === "nobutton") {
+        log("queue stops after " + job.label + " (" + out + ") — needs a human");
+        break;
+      }
     }
     if (!live(myGen)) return;
     var okJobs = jobs.filter(function (j) { return j.ok || j.directWon; });

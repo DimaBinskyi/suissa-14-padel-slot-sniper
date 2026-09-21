@@ -45,9 +45,19 @@
   }
 
   function captureBooking(url, method, headers, body) {
-    if (typeof body !== "string" || bookingTemplate) return;
-    if (suppress.needle && body.indexOf(suppress.needle) === -1) return;
+    if (typeof body !== "string" || bookingTemplate) {
+      log("swallowed a booking call but did not capture it (" +
+          (bookingTemplate ? "already have one" : "body is not a string") + ")");
+      return;
+    }
+    if (suppress.needle && body.indexOf(suppress.needle) === -1) {
+      log("swallowed a booking call that does not carry the expected email — not captured");
+      return;
+    }
     bookingTemplate = { url: url, method: method || "POST", headers: headers || {}, body: body };
+    log("booking request CAPTURED: " + body.length + "b, " +
+        Object.keys(headers || {}).length + " headers, token=" +
+        (/g-recaptcha|recaptcha/i.test(body) ? "present" : "NOT VISIBLE in body"));
     post({ type: "booking-captured", ok: true });
   }
 
@@ -60,9 +70,17 @@
     return { body: out, n: n };
   }
 
+  // Same console as the content script (both log into the page), tagged so the
+  // MAIN-world half of a run can be told apart.
+  function log() {
+    var d = new Date();
+    var t = d.toTimeString().slice(0, 8) + "." + ("00" + d.getMilliseconds()).slice(-3);
+    console.log.apply(console, ["[padel/net " + t + "]"].concat([].slice.call(arguments)));
+  }
+
   function post(msg) {
     msg.__padel = "inject";
-    try { window.postMessage(msg, "*"); } catch (e) { /* noop */ }
+    try { window.postMessage(msg, "*"); } catch (e) { log("postMessage failed", String(e)); }
   }
 
   function classify(url) {
@@ -95,8 +113,10 @@
       captureBooking(this.__pUrl, this.__pMethod, this.__pHeaders, body);
       // Swallow EVERY booking-service call while capture is armed: the page
       // must never actually book the sacrificial slot.
+      log("SWALLOWED the page's booking XHR (nothing was booked)");
       return;
     }
+    if (kind === "book") log("page is sending its own booking XHR (real booking)");
     if (kind === "slots") {
       template = {
         url: this.__pUrl,
@@ -185,10 +205,13 @@
       // Each capture must be fresh — the reCAPTCHA token inside is short-lived
       // and single-use. Already-prepared jobs are left alone.
       bookingTemplate = null;
+      log("swallow ARMED (booking calls will be captured, not sent)");
       post({ type: "suppress-ack", on: true });
     } else if (d.cmd === "suppress-extend") {
       if (suppress) suppress.until = Date.now() + (d.ttl || 60000);
+      log("swallow extended by " + (d.ttl || 60000) + "ms");
     } else if (d.cmd === "suppress-booking-off") {
+      if (suppress) log("swallow DISARMED (real bookings go through again)");
       suppress = null;
     } else if (d.cmd === "prepare-direct") {
       var id = d.id || "a";
@@ -204,14 +227,22 @@
       var okPrep = ((counts[0] || 0) + (counts[2] || 0)) >= 1;
       if (okPrep) prepared[id] = { url: bookingTemplate.url, method: bookingTemplate.method, headers: bookingTemplate.headers, body: pb };
       else delete prepared[id];
+      log("prepare-direct[" + id + "]: " + (okPrep ? "OK" : "FAILED — start epoch not found in body") +
+          ", replacements per pattern = [" + counts.join(",") + "], armed jobs now: [" + Object.keys(prepared).join(",") + "]");
       // Consumed: the next job must capture its own token rather than reuse it.
       bookingTemplate = null;
       post({ type: "direct-prepared", id: id, ok: okPrep, counts: counts });
     } else if (d.cmd === "direct-book") {
       var bid = d.id || "a";
       var req = prepared[bid];
-      if (!req) { post({ type: "direct-book-result", id: bid, status: 0, body: "", error: "not-prepared" }); return; }
+      if (!req) {
+        log("direct-book[" + bid + "] REFUSED: nothing prepared for this job");
+        post({ type: "direct-book-result", id: bid, status: 0, body: "", error: "not-prepared" });
+        return;
+      }
       delete prepared[bid];     // single-use token; never fire the same one twice
+      var t0 = Date.now();
+      log("direct-book[" + bid + "] -> POST " + req.body.length + "b");
       fetch(req.url, {
         method: req.method,
         headers: req.headers,
@@ -219,9 +250,11 @@
         credentials: "include"
       }).then(function (r) {
         return r.text().then(function (t) {
+          log("direct-book[" + bid + "] <- " + r.status + " in " + (Date.now() - t0) + "ms: " + t.slice(0, 300));
           post({ type: "direct-book-result", id: bid, status: r.status, body: t.slice(0, 800) });
         });
       }).catch(function (err) {
+        log("direct-book[" + bid + "] network error after " + (Date.now() - t0) + "ms: " + String(err));
         post({ type: "direct-book-result", id: bid, status: 0, body: "", error: String(err) });
       });
     } else if (d.cmd === "ping") {
@@ -229,5 +262,6 @@
     }
   });
 
+  log("net hooks installed (XHR + fetch) at document_start");
   post({ type: "ready" });
 })();

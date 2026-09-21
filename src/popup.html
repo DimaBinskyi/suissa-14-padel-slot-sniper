@@ -19,7 +19,7 @@
   </div>
 
   <form id="cfg">
-    <label>Дата
+    <label>Дата <span class="hint">— общая для обеих броней</span>
       <div class="row three">
         <select id="dd" aria-label="День"></select>
         <select id="mm" aria-label="Месяц"></select>
@@ -27,51 +27,24 @@
       </div>
     </label>
 
-    <label>Время слота
-      <select id="targetTime">
-        <option value="08:30">8:30am</option>
-        <option value="10:00">10:00am</option>
-        <option value="11:30">11:30am</option>
-        <option value="13:00">1:00pm</option>
-        <option value="14:30">2:30pm</option>
-        <option value="16:00">4:00pm</option>
-        <option value="17:30">5:30pm</option>
-        <option value="19:00">7:00pm</option>
-        <option value="20:30">8:30pm</option>
-      </select>
-    </label>
-
-    <label class="check">
-      <input type="checkbox" id="secondOn" />
-      Второй слот — бронировать два одновременно
-    </label>
-    <fieldset id="secondBox" hidden>
-      <legend>Второй слот (та же дата)</legend>
-      <div class="row two">
-        <label>Время
-          <select id="secondTime">
-            <option value="08:30">8:30am</option>
-            <option value="10:00">10:00am</option>
-            <option value="11:30">11:30am</option>
-            <option value="13:00">1:00pm</option>
-            <option value="14:30">2:30pm</option>
-            <option value="16:00">4:00pm</option>
-            <option value="17:30">5:30pm</option>
-            <option value="19:00">7:00pm</option>
-            <option value="20:30">8:30pm</option>
-          </select>
-        </label>
-        <label>Профиль
-          <select id="secondProfile" aria-label="Профиль для второго слота"></select>
-        </label>
-      </div>
-    </fieldset>
-
-    <fieldset>
-      <legend>Данные для брони</legend>
+    <fieldset class="slot">
+      <legend><span class="badge">1</span> Первая бронь</legend>
+      <label>Время
+        <select id="targetTime">
+          <option value="08:30">8:30am</option>
+          <option value="10:00">10:00am</option>
+          <option value="11:30">11:30am</option>
+          <option value="13:00">1:00pm</option>
+          <option value="14:30">2:30pm</option>
+          <option value="16:00">4:00pm</option>
+          <option value="17:30">5:30pm</option>
+          <option value="19:00">7:00pm</option>
+          <option value="20:30">8:30pm</option>
+        </select>
+      </label>
       <label>Профиль
         <div class="row profile">
-          <select id="profileSelect" aria-label="Профиль"></select>
+          <select id="profileSelect" aria-label="Профиль первой брони"></select>
           <button id="profileAdd" class="icon" type="button" title="Новый профиль">+</button>
           <button id="profileDel" class="icon" type="button" title="Удалить профиль">✕</button>
         </div>
@@ -90,6 +63,35 @@
       <label>Номер квартиры / Flat
         <input type="text" id="flat" autocomplete="off" />
       </label>
+    </fieldset>
+
+    <fieldset class="slot second">
+      <legend>
+        <label class="check inline">
+          <input type="checkbox" id="secondOn" />
+          <span><span class="badge">2</span> Вторая бронь</span>
+        </label>
+      </legend>
+      <div id="secondBox" hidden>
+        <label>Время
+          <select id="secondTime">
+            <option value="08:30">8:30am</option>
+            <option value="10:00">10:00am</option>
+            <option value="11:30">11:30am</option>
+            <option value="13:00">1:00pm</option>
+            <option value="14:30">2:30pm</option>
+            <option value="16:00">4:00pm</option>
+            <option value="17:30">5:30pm</option>
+            <option value="19:00">7:00pm</option>
+            <option value="20:30">8:30pm</option>
+          </select>
+        </label>
+        <label>Профиль
+          <select id="secondProfile" aria-label="Профиль второй брони"></select>
+        </label>
+        <div id="secondPreview" class="preview">—</div>
+      </div>
+      <div id="secondHintOff" class="hint pad">Выключено — бронируется только первый слот.</div>
     </fieldset>
 
     <label class="check">

@@ -1,9 +1,21 @@
 // popup.js — thin UI over chrome.storage. The content script reacts to state
 // changes; the popup only reads/writes config + status.
+//
+// Logging: everything goes through log() to console.log so a run can be read
+// back from the popup's own DevTools console (right-click the popup ->
+// Inspect). The calendar tab's console has the engine's logs.
 var INFO = ["firstName", "lastName", "email", "flat"];
 var MONTHS_RU = ["январь", "февраль", "март", "апрель", "май", "июнь",
   "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"];
 var DEFAULT_URL = "https://calendar.google.com/calendar/u/0/appointments/schedules/AcZssZ10yTRRi6qPrNw8KI4__oFHvyiJDvU_Fwnszv5LGhwBzr_VL1DhIZaCAR4d6g488tLvnhFNtzsu";
+
+function stamp() {
+  var d = new Date();
+  return d.toTimeString().slice(0, 8) + "." + ("00" + d.getMilliseconds()).slice(-3);
+}
+function log() {
+  console.log.apply(console, ["[padel popup " + stamp() + "]"].concat([].slice.call(arguments)));
+}
 
 function get(keys) { return new Promise(function (r) { chrome.storage.local.get(keys, r); }); }
 function set(obj) { return new Promise(function (r) { chrome.storage.local.set(obj, r); }); }
@@ -75,7 +87,22 @@ function profileById(id) {
   return null;
 }
 function applySecondVisibility() {
-  el("secondBox").hidden = !el("secondOn").checked;
+  var on = el("secondOn").checked;
+  el("secondBox").hidden = !on;
+  el("secondHintOff").hidden = on;
+  renderSecondPreview();
+}
+
+// Profiles are labelled by name only, so spell out who the second booking
+// actually books — a wrong email/flat is otherwise invisible until midnight.
+function renderSecondPreview() {
+  var box = el("secondPreview");
+  if (!box) return;
+  var p = profileById(el("secondProfile").value);
+  if (!p) { box.textContent = "— профиль не выбран"; return; }
+  var name = ((p.firstName || "") + " " + (p.lastName || "")).trim() || "без имени";
+  box.textContent = name + " · " + (p.email || "без email") + " · кв. " + (p.flat || "—");
+  box.title = box.textContent;
 }
 function fillInfoInputs(p) {
   INFO.forEach(function (id) { el(id).value = p[id] || ""; });
@@ -186,6 +213,7 @@ async function restore() {
   if (!activeProfile()) { activeProfileId = profiles[0].id; migrated = true; }
   renderProfileSelect();
   if (sec && sec.profileId && profileById(sec.profileId)) el("secondProfile").value = sec.profileId;
+  renderSecondPreview();
   fillInfoInputs(activeProfile());
   if (migrated) await saveProfiles();
   // cfg stays the booking source of truth — re-sync it if it diverged.
@@ -194,9 +222,18 @@ async function restore() {
 
   applyToggle(st.state || "idle");
   applyStatus(st.status, st.state || "idle");
+  log("popup opened: state=" + (st.state || "idle"),
+      "profiles=" + profiles.length,
+      "status=" + (st.status ? st.status.text : "—"));
 }
 
-async function saveCfg() { await set({ cfg: readForm() }); }
+async function saveCfg() {
+  var cfg = readForm();
+  log("cfg saved:", "date=" + cfg.targetDate, "slot1=" + cfg.targetTime + " <" + cfg.email + "> кв." + cfg.flat,
+      cfg.second ? "slot2=" + cfg.second.time + " <" + cfg.second.email + "> кв." + cfg.second.flat : "slot2=off",
+      "autoBook=" + cfg.autoBook);
+  await set({ cfg: cfg });
+}
 
 // Returns an error string, or "" when the config can be armed.
 function cfgProblem(cfg) {
@@ -212,11 +249,13 @@ async function toggle() {
   var st = await get(["state"]);
   var on = (st.state === "armed" || st.state === "grab");
   if (on) {
+    log("DISARM requested (state was " + st.state + ")");
     await set({ state: "idle", status: { text: "Выключено", level: "info" } });
   } else {
     var cfg = readForm();
     var bad = cfgProblem(cfg);
-    if (bad) { alert(bad); return; }
+    if (bad) { log("ARM rejected:", bad); alert(bad); return; }
+    log("ARM requested:", cfg.targetDate, cfg.targetTime + (cfg.second ? " + " + cfg.second.time : ""));
     await set({ cfg: cfg, state: "armed", status: { text: "Ожидание слота…", level: "info" } });
   }
 }
@@ -224,7 +263,8 @@ async function toggle() {
 async function bookNow() {
   var cfg = readForm();
   var problem = cfgProblem(cfg);
-  if (problem) { alert(problem); return; }
+  if (problem) { log("bookNow rejected:", problem); alert(problem); return; }
+  log("BOOK NOW requested:", cfg.targetDate, cfg.targetTime + (cfg.second ? " + " + cfg.second.time : ""));
   // Fast mode: no reload. The content script grabs on the already-open tab.
   await set({ cfg: cfg, state: "grab", status: { text: "Бронирую…", level: "info" } });
   chrome.tabs.query({ url: "https://calendar.google.com/calendar/*/appointments/schedules/*" }, function (tabs) {
@@ -255,9 +295,11 @@ function init() {
     el(id).addEventListener("change", saveCfg);
   });
   el("secondOn").addEventListener("change", function () {
+    log("second booking " + (el("secondOn").checked ? "ENABLED" : "disabled"));
     applySecondVisibility();
     saveCfg();
   });
+  el("secondProfile").addEventListener("change", renderSecondPreview);
   INFO.forEach(function (id) {
     el(id).addEventListener("input", onInfoEdit);
     el(id).addEventListener("change", onInfoEdit);
@@ -276,6 +318,11 @@ else init();
 
 chrome.storage.onChanged.addListener(function (changes, area) {
   if (area !== "local") return;
+  if (changes.status && changes.status.newValue) {
+    var s = changes.status.newValue;
+    log("status[" + (s.level || "info") + "]", s.text);
+  }
+  if (changes.state) log("state ->", changes.state.newValue);
   get(["state", "status"]).then(function (st) {
     applyToggle(st.state || "idle");
     applyStatus(st.status, st.state || "idle");

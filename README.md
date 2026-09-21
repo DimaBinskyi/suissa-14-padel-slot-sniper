@@ -161,7 +161,27 @@ booking, and may need a small tweak the first time you run it live:
   `bframe` iframe. If a challenge slips through, capture its iframe `src`/DOM and
   adjust.
 
-Open the tab's DevTools console to see `[padel]` logs during a run.
+## Reading the logs
+
+Everything goes through `console.log`, tagged and timestamped to the
+millisecond. Once the clock is synced, lines also carry the signed offset to
+the court's midnight (`T-12.345s` / `T+0.150s`) — that offset is the number to
+look at when tuning the shot.
+
+| Tag | Where to open it |
+|-----|------------------|
+| `[padel …]` | engine (calendar tab → DevTools console) |
+| `[padel/net …]` | network hooks, MAIN world (same console) |
+| `[padel popup …]` | popup (right-click the popup → Inspect) |
+| `[padel bg …]` | notifications (`chrome://extensions` → *service worker*) |
+
+The radar replays ~3×/s, so outside the rollover window it logs a 10-second
+heartbeat (`radar heartbeat: 33/33 ok in 10s, midnight in 214s`); inside the
+turbo window every response is logged individually. Key lines to look for on a
+live night: `clock sync: server offset …`, `booking request CAPTURED`,
+`prepare-direct[a]: OK, replacements per pattern = [1,1,0,0,2]`,
+`FIRE (scheduled drift …)`, `direct-book[a] <- 200 in 74ms`, and
+`verify 20:30 (Dmytro): http=200 slotStillOpen=false -> WON`.
 
 ## Scope / ethics
 
