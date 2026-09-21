@@ -530,12 +530,13 @@
   var TURBO_POKE_MS = 600;     // how often to make the app refetch
   var TURBO_REPLAY_MS = 600;   // radar cadence while turbo is poking
   // Direct shot: build the booking request this early. Later = younger token
-  // at fire time (~45s old; TTL is ~120s), but it must leave room for one
-  // retry and a challenge before the turbo window — don't push below ~30s.
+  // at fire time (~18s old with a 20s lead; TTL is ~120s). Deliberately tight:
+  // capture typically takes 3-6s, leaving one fast retry; a slow capture or a
+  // challenge means no direct shot that night — the UI path is unaffected.
   // Fire this long after corrected midnight (cushion for residual clock
   // error — too early and the server rejects it AND the single-use token is
   // spent).
-  var DIRECT_PREP_LEAD_MS = 45000;
+  var DIRECT_PREP_LEAD_MS = 20000;
   var DIRECT_SEND_DELAY_MS = 120;
   function inTurboWindow() {
     var left = msUntilCourtMidnightCorrected();
@@ -737,7 +738,7 @@
         var leftMs = msUntilCourtMidnightCorrected();
         var opensTonight = !!cfg.autoBook && ymd(td) === courtYmdPlus(2);
         if (opensTonight && !directCtl.prepared && directCtl.attempts < 2 &&
-            leftMs <= DIRECT_PREP_LEAD_MS && leftMs > 20000) {
+            leftMs <= DIRECT_PREP_LEAD_MS && leftMs > 8000) {
           directCtl.attempts++;
           directCtl.prepared = await prepareDirectBooking(td, timeMin, cfg, myGen, function () { return grabbed; });
           if (!live(myGen) || grabbed) return;

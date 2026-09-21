@@ -56,15 +56,17 @@ target date opens (and only with auto-Book on), a third worker now runs:
 1. **Clock sync** — every replayed availability response carries a `Date`
    header; an NTP-style median gives `server − local` offset, so midnight is
    scheduled on **Google's clock**, not the Mac's.
-2. **Capture (~T−45 s)** — open the booking modal on any *currently open*
+2. **Capture (~T−20 s)** — open the booking modal on any *currently open*
    (sacrificial) slot, fill the real data, and click **Book** while the network
    hook **swallows** the outgoing booking RPC. The page itself validates the
    form and mints its own invisible-reCAPTCHA token; we keep the complete
    request it built (headers incl. fresh SAPISIDHASH + body incl. the token)
    and discard the modal. Nothing is booked. If a captcha *challenge* pops up
    here, you get a notification and whatever time remains before midnight
-   (up to 45 s) to solve it — solving lets the capture complete; the tool
-   never solves or bypasses it.
+   (~10 s with the tight 20 s lead) to solve it — solving lets the capture
+   complete; the tool never solves or bypasses it. A slow capture or an
+   unsolved challenge just means no direct shot that night; the UI path is
+   unaffected.
 3. **Retarget** — the sacrificial slot's start/end epochs (ms and seconds
    forms, digit-boundary-safe) and `YYYYMMDD` are rewritten to the target slot.
    If the start epoch isn't found in the body, the direct shot is aborted.
@@ -80,7 +82,7 @@ target date opens (and only with auto-Book on), a third worker now runs:
    you get a "перехвачен" notification instead of a silent hang.
 
 Caveats needing one live pass: the booking RPC body format (epoch replacement
-counts are logged as `direct shot prepared`), whether the token survives ~45 s
+counts are logged as `direct shot prepared`), whether the token survives ~20 s
 (if Google rejects it, the UI fallback still fires), and the exact
 "no longer available" wording for fail-fast detection. Keep the calendar tab
 **visible** (own window is fine) around midnight — Chrome throttles timers in
