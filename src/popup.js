@@ -57,6 +57,25 @@ function renderProfileSelect() {
   while (sel.options.length) sel.remove(0);
   profiles.forEach(function (p, i) { sel.add(new Option(profileLabel(p, i), p.id)); });
   sel.value = activeProfileId;
+  renderSecondProfile();
+}
+
+// The second slot picks a whole profile (usually another resident) rather than
+// repeating the four text fields.
+function renderSecondProfile() {
+  var sel = el("secondProfile");
+  var keep = sel.value;
+  while (sel.options.length) sel.remove(0);
+  profiles.forEach(function (p, i) { sel.add(new Option(profileLabel(p, i), p.id)); });
+  if (keep && profiles.some(function (p) { return p.id === keep; })) sel.value = keep;
+  else if (profiles.length) sel.value = profiles[profiles.length > 1 ? 1 : 0].id;
+}
+function profileById(id) {
+  for (var i = 0; i < profiles.length; i++) if (profiles[i].id === id) return profiles[i];
+  return null;
+}
+function applySecondVisibility() {
+  el("secondBox").hidden = !el("secondOn").checked;
 }
 function fillInfoInputs(p) {
   INFO.forEach(function (id) { el(id).value = p[id] || ""; });
@@ -103,6 +122,7 @@ function onInfoEdit() {
     INFO.forEach(function (id) { p[id] = el(id).value; });
     var sel = el("profileSelect");
     if (sel.selectedIndex >= 0) sel.options[sel.selectedIndex].text = profileLabel(p, sel.selectedIndex);
+    renderSecondProfile();     // labels follow the name as it's typed
     saveProfiles();
   }
   saveCfg();
@@ -115,6 +135,14 @@ function readForm() {
   cfg.targetTime = el("targetTime").value;
   INFO.forEach(function (id) { cfg[id] = el(id).value; });
   cfg.autoBook = el("autoBook").checked;
+  // Second slot: same date, another time, booked with another profile's data.
+  // Stored flat so the content script reads it without touching `profiles`.
+  cfg.second = null;
+  if (el("secondOn").checked) {
+    var p = profileById(el("secondProfile").value);
+    cfg.second = { time: el("secondTime").value, profileId: p ? p.id : null };
+    INFO.forEach(function (id) { cfg.second[id] = p ? (p[id] || "") : ""; });
+  }
   return cfg;
 }
 
@@ -140,6 +168,11 @@ async function restore() {
   if (cfg.targetTime) el("targetTime").value = cfg.targetTime;
   el("autoBook").checked = cfg.autoBook !== false;
 
+  var sec = cfg.second;
+  el("secondOn").checked = !!(sec && sec.time);
+  if (sec && sec.time) el("secondTime").value = sec.time;
+  applySecondVisibility();
+
   profiles = Array.isArray(st.profiles) ? st.profiles : [];
   activeProfileId = st.activeProfileId;
   var migrated = false;
@@ -152,6 +185,7 @@ async function restore() {
   }
   if (!activeProfile()) { activeProfileId = profiles[0].id; migrated = true; }
   renderProfileSelect();
+  if (sec && sec.profileId && profileById(sec.profileId)) el("secondProfile").value = sec.profileId;
   fillInfoInputs(activeProfile());
   if (migrated) await saveProfiles();
   // cfg stays the booking source of truth — re-sync it if it diverged.
@@ -164,6 +198,16 @@ async function restore() {
 
 async function saveCfg() { await set({ cfg: readForm() }); }
 
+// Returns an error string, or "" when the config can be armed.
+function cfgProblem(cfg) {
+  if (!cfg.targetDate || !cfg.targetTime) return "Заполни дату и время.";
+  if (cfg.second) {
+    if (cfg.second.time === cfg.targetTime) return "Второй слот должен быть на другое время.";
+    if (!cfg.second.email && !cfg.second.firstName) return "Выбери профиль для второго слота.";
+  }
+  return "";
+}
+
 async function toggle() {
   var st = await get(["state"]);
   var on = (st.state === "armed" || st.state === "grab");
@@ -171,14 +215,16 @@ async function toggle() {
     await set({ state: "idle", status: { text: "Выключено", level: "info" } });
   } else {
     var cfg = readForm();
-    if (!cfg.targetDate || !cfg.targetTime) { alert("Заполни дату и время."); return; }
+    var bad = cfgProblem(cfg);
+    if (bad) { alert(bad); return; }
     await set({ cfg: cfg, state: "armed", status: { text: "Ожидание слота…", level: "info" } });
   }
 }
 
 async function bookNow() {
   var cfg = readForm();
-  if (!cfg.targetDate || !cfg.targetTime) { alert("Заполни дату и время."); return; }
+  var problem = cfgProblem(cfg);
+  if (problem) { alert(problem); return; }
   // Fast mode: no reload. The content script grabs on the already-open tab.
   await set({ cfg: cfg, state: "grab", status: { text: "Бронирую…", level: "info" } });
   chrome.tabs.query({ url: "https://calendar.google.com/calendar/*/appointments/schedules/*" }, function (tabs) {
@@ -205,8 +251,12 @@ function init() {
   buildDateSelects();
   restore();
   // Autosave: selects/checkbox on change, text inputs on every keystroke.
-  ["dd", "mm", "yyyy", "targetTime", "autoBook"].forEach(function (id) {
+  ["dd", "mm", "yyyy", "targetTime", "autoBook", "secondTime", "secondProfile"].forEach(function (id) {
     el(id).addEventListener("change", saveCfg);
+  });
+  el("secondOn").addEventListener("change", function () {
+    applySecondVisibility();
+    saveCfg();
   });
   INFO.forEach(function (id) {
     el(id).addEventListener("input", onInfoEdit);

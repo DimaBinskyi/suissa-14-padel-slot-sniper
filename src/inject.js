@@ -28,9 +28,13 @@
   // is swallowed before it reaches the network, and the request it built
   // (headers + body incl. the FRESH reCAPTCHA token the page just minted) is
   // kept as bookingTemplate. prepare-direct rewrites its slot epochs into
-  // preparedRequest, which direct-book fires verbatim at midnight.
+  // prepared[id], which direct-book fires verbatim at midnight.
+  //
+  // prepared is keyed by job id so several slots can be armed at once (each
+  // from its own capture, since a reCAPTCHA token is single-use) and fired
+  // together at the rollover.
   var bookingTemplate = null;
-  var preparedRequest = null;
+  var prepared = {};
   var suppress = null;          // { needle, until }
 
   function suppressActive() {
@@ -179,16 +183,16 @@
     } else if (d.cmd === "suppress-booking-on") {
       suppress = { needle: d.needle || "", until: Date.now() + 20000 };
       // Each capture must be fresh — the reCAPTCHA token inside is short-lived
-      // and single-use.
+      // and single-use. Already-prepared jobs are left alone.
       bookingTemplate = null;
-      preparedRequest = null;
       post({ type: "suppress-ack", on: true });
     } else if (d.cmd === "suppress-extend") {
       if (suppress) suppress.until = Date.now() + (d.ttl || 60000);
     } else if (d.cmd === "suppress-booking-off") {
       suppress = null;
     } else if (d.cmd === "prepare-direct") {
-      if (!bookingTemplate) { post({ type: "direct-prepared", ok: false, counts: [] }); return; }
+      var id = d.id || "a";
+      if (!bookingTemplate) { post({ type: "direct-prepared", id: id, ok: false, counts: [] }); return; }
       var pb = bookingTemplate.body, counts = [];
       (d.repl || []).forEach(function (pair) {
         var r2 = replaceNum(pb, pair[0], pair[1]);
@@ -198,21 +202,27 @@
       // counts[0]/[2] are the start epoch in ms/seconds form — one must have hit,
       // otherwise we don't understand the body and must not fire it.
       var okPrep = ((counts[0] || 0) + (counts[2] || 0)) >= 1;
-      preparedRequest = okPrep ? { url: bookingTemplate.url, method: bookingTemplate.method, headers: bookingTemplate.headers, body: pb } : null;
-      post({ type: "direct-prepared", ok: okPrep, counts: counts });
+      if (okPrep) prepared[id] = { url: bookingTemplate.url, method: bookingTemplate.method, headers: bookingTemplate.headers, body: pb };
+      else delete prepared[id];
+      // Consumed: the next job must capture its own token rather than reuse it.
+      bookingTemplate = null;
+      post({ type: "direct-prepared", id: id, ok: okPrep, counts: counts });
     } else if (d.cmd === "direct-book") {
-      if (!preparedRequest) { post({ type: "direct-book-result", status: 0, body: "", error: "not-prepared" }); return; }
-      fetch(preparedRequest.url, {
-        method: preparedRequest.method,
-        headers: preparedRequest.headers,
-        body: preparedRequest.body,
+      var bid = d.id || "a";
+      var req = prepared[bid];
+      if (!req) { post({ type: "direct-book-result", id: bid, status: 0, body: "", error: "not-prepared" }); return; }
+      delete prepared[bid];     // single-use token; never fire the same one twice
+      fetch(req.url, {
+        method: req.method,
+        headers: req.headers,
+        body: req.body,
         credentials: "include"
       }).then(function (r) {
         return r.text().then(function (t) {
-          post({ type: "direct-book-result", status: r.status, body: t.slice(0, 800) });
+          post({ type: "direct-book-result", id: bid, status: r.status, body: t.slice(0, 800) });
         });
       }).catch(function (err) {
-        post({ type: "direct-book-result", status: 0, body: "", error: String(err) });
+        post({ type: "direct-book-result", id: bid, status: 0, body: "", error: String(err) });
       });
     } else if (d.cmd === "ping") {
       post({ type: "pong", hasTemplate: !!template });

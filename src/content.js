@@ -53,10 +53,15 @@
   var lastAppSlots = { body: "", ts: 0 }; // latest APP-initiated ListAvailableSlots response
   var onSlotsBody = null;    // armed-mode hook: called with EVERY availability body on arrival
 
+  // Waiters are { fn, pred }. A waiter with a predicate only takes messages it
+  // matches and stays queued otherwise — needed once two jobs have direct-shot
+  // requests in flight, so one job's result can't resolve the other's promise.
   function flushWaiters(list, d) {
-    var w = list.slice();
+    var keep = [], fire = [];
+    list.forEach(function (w) { (!w.pred || w.pred(d) ? fire : keep).push(w); });
     list.length = 0;
-    w.forEach(function (fn) { fn(d); });
+    keep.forEach(function (w) { list.push(w); });
+    fire.forEach(function (w) { w.fn(d); });
   }
 
   window.addEventListener("message", function (e) {
@@ -90,22 +95,24 @@
     window.postMessage(msg, "*");
   }
 
-  // Wait for the next message flushed into `list`; optionally fire the request
-  // that should produce it. Resolves null on timeout.
-  function awaitMsg(list, timeoutMs, sendFn) {
+  // Wait for the next message flushed into `list` (optionally only those
+  // matching `pred`); `sendFn` fires the request that should produce it.
+  // Resolves null on timeout.
+  function awaitMsg(list, timeoutMs, sendFn, pred) {
     return new Promise(function (res) {
       var done = false;
       var t = setTimeout(function () { if (!done) { done = true; res(null); } }, timeoutMs);
-      list.push(function (d) { if (!done) { done = true; clearTimeout(t); res(d); } });
+      list.push({ pred: pred, fn: function (d) { if (!done) { done = true; clearTimeout(t); res(d); } } });
       if (sendFn) sendFn();
     });
   }
+  function byId(id) { return function (d) { return d && d.id === id; }; }
 
   function replayOnce(timeoutMs) {
     return new Promise(function (res) {
       var done = false;
       var t = setTimeout(function () { if (!done) { done = true; res({ body: "", status: 0, timeout: true }); } }, timeoutMs || 5000);
-      slotWaiters.push(function (d) { if (!done) { done = true; clearTimeout(t); res(d); } });
+      slotWaiters.push({ fn: function (d) { if (!done) { done = true; clearTimeout(t); res(d); } } });
       toInject("replay");
     });
   }
@@ -113,7 +120,7 @@
     return new Promise(function (res) {
       var done = false;
       var t = setTimeout(function () { if (!done) { done = true; res(null); } }, timeoutMs || 20000);
-      bookingWaiters.push(function (d) { if (!done) { done = true; clearTimeout(t); res(d); } });
+      bookingWaiters.push({ fn: function (d) { if (!done) { done = true; clearTimeout(t); res(d); } } });
     });
   }
 
@@ -320,6 +327,25 @@
     var txt = (dlg.textContent || "");
     return new RegExp(MONTHS[td.m - 1] + "\\s+" + td.d + "\\b").test(txt);
   }
+  function hhmm12(min) {
+    var h = Math.floor(min / 60) % 24, h12 = h % 12;
+    return (h12 === 0 ? 12 : h12) + ":" + pad(min % 60);
+  }
+  function meridiem(min) { return (Math.floor(min / 60) % 24) < 12 ? "am" : "pm"; }
+  // With two jobs in play, a modal left open by the OTHER slot must not be
+  // filled in for this one. The header reads "Wednesday, July 8, 4:00 – 5:30pm":
+  // the start time carries no am/pm, so the 90-min end time identifies the slot.
+  // Deliberately defensive — if no time pattern is recognisable at all we do
+  // NOT block the booking, since the slot button we clicked already matched the
+  // exact time. Only a clearly different time counts as a mismatch.
+  function modalShowsOtherTime(timeMin) {
+    var d = dialogEl();
+    if (!d) return false;
+    var t = (d.textContent || "").toLowerCase().replace(/\s+/g, "");
+    var endMin = timeMin + 90;
+    if (t.indexOf(hhmm12(endMin) + meridiem(endMin)) !== -1) return false;
+    return /\d{1,2}:\d{2}(am|pm)/.test(t);
+  }
   // "Wednesday, July 8, 4:00 – 5:30pm" -> {y,m,d}. The header has no year, but
   // bookable dates are never more than a couple of days out, so pick the year
   // that puts the date near today.
@@ -509,6 +535,37 @@
     await closeModal();
   }
 
+  // ---------- jobs ----------
+  // One job = one slot to book with one identity. A midnight rollover opens
+  // exactly ONE new day, so every job shares cfg.targetDate and differs only
+  // in time + form data. Two slots are booked by firing both direct shots at
+  // once; the UI fallback works through them one modal at a time.
+  function jobData(src) {
+    return {
+      firstName: src.firstName || "", lastName: src.lastName || "",
+      email: src.email || "", flat: src.flat || ""
+    };
+  }
+  function buildJobs(cfg) {
+    var out = [];
+    var m0 = hhmmToMinutes(cfg.targetTime);
+    if (m0 >= 0) out.push({ id: "a", time: cfg.targetTime, timeMin: m0, data: jobData(cfg) });
+    var s = cfg.second;
+    if (s && s.time) {
+      var m1 = hhmmToMinutes(s.time);
+      // Same time twice would just make two jobs fight over one slot.
+      if (m1 >= 0 && m1 !== m0) out.push({ id: "b", time: s.time, timeMin: m1, data: jobData(s) });
+    }
+    out.forEach(function (j) {
+      j.label = j.time + (j.data.firstName ? " (" + j.data.firstName + ")" : "");
+      j.prepared = false; j.directWon = false; j.done = false; j.ok = false;
+    });
+    return out;
+  }
+  function jobTimes(jobs) {
+    return jobs.map(function (j) { return j.label; }).join(" + ");
+  }
+
   // ---------- run control ----------
   // Every start captures runGen; any state change bumps runGen, so a running
   // loop bails at its next checkpoint. This makes "Выключить" stop instantly.
@@ -537,6 +594,11 @@
   // error — too early and the server rejects it AND the single-use token is
   // spent).
   var DIRECT_PREP_LEAD_MS = 20000;
+  // Captures are strictly sequential (one modal in the DOM at a time), so each
+  // extra slot needs its own window of lead time. Only the FIRST token pays the
+  // full wait; later ones are younger.
+  var DIRECT_PREP_PER_JOB_MS = 12000;
+  function directPrepLeadMs(n) { return DIRECT_PREP_LEAD_MS + Math.max(0, n - 1) * DIRECT_PREP_PER_JOB_MS; }
   var DIRECT_SEND_DELAY_MS = 120;
   function inTurboWindow() {
     var left = msUntilCourtMidnightCorrected();
@@ -555,13 +617,9 @@
   // other. If both land, the worst case is a duplicate booking to cancel by
   // hand — losing the slot costs more than an extra cancellation.
   //
-  // Set when the direct shot booked the slot; the UI grab uses it only to
-  // label its own outcome correctly (our own booking is not a rival's).
-  var directWon = false;
-
-  async function prepareDirectBooking(td, timeMin, cfg, myGen, isGrabbed) {
+  async function prepareDirectBooking(td, job, cfg, myGen, isGrabbed) {
     try {
-      setStatus("Готовлю прямой запрос (шаблон + токен)…");
+      setStatus("Готовлю прямой запрос для " + job.label + "…");
       if (dialogEl()) { await closeModal(); if (!live(myGen) || isGrabbed()) return false; }
       var all = slotButtonsAll();
       if (!all.length) { log("direct prep: no slot buttons on screen"); return false; }
@@ -577,16 +635,16 @@
       var pd = parseModalDate();
       if (!pd || btnMin < 0) { log("direct prep: could not read sacrificial date/time"); await closeModal(); return false; }
       var pCand = targetEpochCandidates(pd, btnMin);
-      var tCand = targetEpochCandidates(td, timeMin);
+      var tCand = targetEpochCandidates(td, job.timeMin);
       var pMs = parseInt(pCand[0], 10), tMs = parseInt(tCand[0], 10);
       if (!pMs || !tMs || pMs === tMs) { log("direct prep: bad epochs", pMs, tMs); await closeModal(); return false; }
-      if (!(await fillForm(cfg))) { log("direct prep: form did not fill"); await closeModal(); return false; }
+      if (!(await fillForm(job.data))) { log("direct prep: form did not fill"); await closeModal(); return false; }
       if (!live(myGen) || isGrabbed()) { await closeModal(); return false; }
       // Arm the swallow and WAIT for the ack: the Book click below can reach
       // xhr.send synchronously, before an unacked postMessage would arrive —
       // and then the sacrificial slot would get booked for real.
       var ack = await awaitMsg(suppressWaiters, 1500, function () {
-        toInject({ cmd: "suppress-booking-on", needle: cfg.email || "" });
+        toInject({ cmd: "suppress-booking-on", needle: job.data.email || "" });
       });
       if (!ack) { log("direct prep: no suppress ack"); await closeModal(); return false; }
       var book = bookButton();
@@ -618,10 +676,10 @@
         [ymd(pd), ymd(td)]
       ];
       var prep = await awaitMsg(preparedWaiters, 3000, function () {
-        toInject({ cmd: "prepare-direct", repl: repl });
-      });
+        toInject({ cmd: "prepare-direct", id: job.id, repl: repl });
+      }, byId(job.id));
       if (!prep || !prep.ok) { log("direct prep: epoch rewrite failed", prep && prep.counts); return false; }
-      log("direct shot prepared, replacement counts:", prep.counts);
+      log("direct shot prepared for " + job.label + ", replacement counts:", prep.counts);
       return true;
     } catch (e) {
       log("direct prep error", e);
@@ -633,20 +691,44 @@
     }
   }
 
-  async function scheduleMidnightFire(td, timeMin, cfg, myGen, ctl, isGrabbed) {
+  // Capture one request per job, sequentially (single modal in the DOM). Each
+  // job gets its own reCAPTCHA token because tokens are single-use. Stops early
+  // if midnight gets too close to finish another capture safely.
+  async function prepareDirectShots(td, jobs, cfg, myGen, isGrabbed) {
+    for (var i = 0; i < jobs.length; i++) {
+      var job = jobs[i];
+      if (job.prepared) continue;
+      if (msUntilCourtMidnightCorrected() < 9000) {
+        log("direct prep: not enough time left for " + job.label);
+        break;
+      }
+      job.prepared = await prepareDirectBooking(td, job, cfg, myGen, isGrabbed);
+      if (!live(myGen) || isGrabbed()) return;
+    }
+  }
+
+  async function scheduleMidnightFire(td, jobs, cfg, myGen, isGrabbed) {
     var fireAt = Date.now() + msUntilCourtMidnightCorrected() + DIRECT_SEND_DELAY_MS;
     while (Date.now() < fireAt) {
       if (!live(myGen) || isGrabbed()) return;
       await sleep(Math.min(40, Math.max(4, fireAt - Date.now())));
     }
     if (!live(myGen)) return;
-    // The shot goes out first — every ms counts — then the fallback burst:
+    // The shots go out first — every ms counts — then the fallback burst:
     // select the target day so the app fetches/renders it, and give the radar
     // immediate samples instead of waiting out its cadence.
-    var resP = null;
-    if (ctl.prepared) {
-      resP = awaitMsg(directWaiters, 4000, function () { toInject("direct-book"); });
-      setStatus("Полночь — прямой запрос ушёл ⚡");
+    var armed = jobs.filter(function (j) { return j.prepared; });
+    var shots = armed.map(function (j) {
+      // All shots leave in the same tick: two slots are booked truly in
+      // parallel, each arriving one RTT after the rollover.
+      return awaitMsg(directWaiters, 4000, function () {
+        toInject({ cmd: "direct-book", id: j.id });
+      }, byId(j.id)).then(function (res) { return { job: j, res: res }; });
+    });
+    if (armed.length) {
+      setStatus(armed.length > 1
+        ? "Полночь — " + armed.length + " прямых запроса ушли ⚡"
+        : "Полночь — прямой запрос ушёл ⚡");
     }
     if (!isGrabbed()) {
       var cell = dateCellButton(ymd(td));
@@ -655,36 +737,43 @@
       setTimeout(function () { if (live(myGen)) toInject("replay"); }, 150);
       setTimeout(function () { if (live(myGen)) toInject("replay"); }, 320);
     }
-    if (!resP) return;
-    var res = await resP;
+    if (!shots.length) return;
+
+    var settled = await Promise.all(shots);
     if (!live(myGen)) return;
-    if (!(res && res.status === 200)) {
-      log("direct shot failed (status " + (res && res.status) + " " + (res && res.error || "") + ") — UI grab continues");
-      // If the slot is ALSO gone from availability, a rival got it — say so.
-      await sleep(1500);
-      if (!live(myGen) || isGrabbed()) return;
-      var gone = await replayOnce(1600);
-      if (gone && gone.body && !bodiesContainTarget([gone.body], td, timeMin)) {
-        setStatus("Слот перехватили раньше нас", "error");
-        notify("Padel: слот перехвачен", "Кто-то забронировал " + cfg.targetTime + " первым.", true);
-        await setState("idle");
+    settled.forEach(function (s) {
+      if (!(s.res && s.res.status === 200)) {
+        log("direct shot for " + s.job.label + " failed (status " + (s.res && s.res.status) +
+            " " + ((s.res && s.res.error) || "") + ") — UI grab continues");
       }
-      return;
-    }
-    // 200 can still hide an in-body error; believe it only once availability
-    // confirms the slot is gone. If it's still open, let the UI grab take it.
+    });
+    // A 200 can still hide an in-body error, so believe it only once
+    // availability shows the slot gone. One replay verifies every job.
     var chk = await replayOnce(1600);
-    var won = !(chk && chk.body && bodiesContainTarget([chk.body], td, timeMin));
-    if (won) {
-      directWon = true;
-      setStatus("✅ Слот " + cfg.targetTime + " забронирован прямым запросом!", "ok");
-      notify("✅ Padel забронирован", "Слот " + cfg.targetDate + " " + cfg.targetTime + " занят прямым запросом. Проверь почту.", true);
-      // Don't kill a UI grab mid-flight — it runs independently and reports
-      // its own outcome. Only disarm when nothing else is booking.
-      if (!isGrabbed()) await setState("idle");
-    } else {
-      log("direct shot got 200 but the slot is still open — UI grab continues");
+    if (!live(myGen)) return;
+    var body = (chk && chk.body) || "";
+    var wonJobs = [], lostJobs = [];
+    settled.forEach(function (s) {
+      var gone = !(body && bodiesContainTarget([body], td, s.job.timeMin));
+      if (s.res && s.res.status === 200 && gone) { s.job.directWon = true; wonJobs.push(s.job); }
+      else lostJobs.push(s.job);
+    });
+    if (wonJobs.length) {
+      var names = wonJobs.map(function (j) { return j.label; }).join(" + ");
+      setStatus("✅ " + names + " забронирован прямым запросом!", "ok");
+      notify("✅ Padel забронирован", "Слот " + cfg.targetDate + " " + names + " занят прямым запросом. Проверь почту.", true);
     }
+    // Nothing of ours got through and the slots are gone too -> a rival won.
+    if (!wonJobs.length && lostJobs.length && body && !isGrabbed()) {
+      var stolen = lostJobs.filter(function (j) { return !bodiesContainTarget([body], td, j.timeMin); });
+      if (stolen.length) {
+        setStatus("Слот перехватили раньше нас", "error");
+        notify("Padel: слот перехвачен", "Кто-то забронировал " +
+          stolen.map(function (j) { return j.time; }).join(", ") + " первым.", true);
+      }
+    }
+    // Don't disarm while a UI grab is still working — it reports its own result.
+    if (!isGrabbed() && wonJobs.length === jobs.length) await setState("idle");
   }
 
   async function startPolling(myGen) {
@@ -692,23 +781,27 @@
     if (!live(myGen)) return;
     var cfg = st[CFG_KEY] || {};
     var td = parseTargetDate(cfg.targetDate);
-    var timeMin = hhmmToMinutes(cfg.targetTime);
-    if (!td || timeMin < 0) { setStatus("Заполни дату и время в popup", "error"); return; }
+    var jobs = buildJobs(cfg);
+    if (!td || !jobs.length) { setStatus("Заполни дату и время в popup", "error"); return; }
 
-    directWon = false;
-    setStatus("Жду открытия слота " + cfg.targetDate + " " + cfg.targetTime + " (радар " + REPLAY_MS + "мс)…");
+    setStatus("Жду открытия " + jobTimes(jobs) + " на " + cfg.targetDate + " (радар " + REPLAY_MS + "мс)…");
 
     var grabbed = false;
     // Detection MUST be time-specific: look for the EXACT slot's epoch in the
     // response. A day-level "date is available" check falsely fires when the
     // day already has OTHER times open (e.g. 8:30/2:30 exist but 1:00pm doesn't).
+    // With two jobs the whole day opens in one response, so the first hit for
+    // ANY job starts the booking queue for all of them.
     function tryDetect(bodies) {
       if (grabbed || !live(myGen)) return false;
-      if (!bodiesContainTarget(bodies, td, timeMin)) return false;
+      var hit = jobs.filter(function (j) {
+        return !j.done && bodiesContainTarget(bodies, td, j.timeMin);
+      });
+      if (!hit.length) return false;
       grabbed = true;
       onSlotsBody = null;
-      log("target slot detected in ListAvailableSlots response");
-      grab(td, timeMin, cfg, myGen);
+      log("slot detected in ListAvailableSlots response:", jobTimes(hit));
+      runGrabs(td, jobs, cfg, myGen);
       return true;
     }
     // Event-driven path: every availability response (the app's own or a
@@ -726,7 +819,8 @@
       parkedYmd = 0;                        // the prewarm click moved the view
       var nextMaint = Date.now() + MAINTENANCE_MS;
       var turboOn = false;
-      var directCtl = { attempts: 0, prepared: false, scheduled: false };
+      var directCtl = { attempts: 0, scheduled: false };
+      var prepLead = directPrepLeadMs(jobs.length);
       while (live(myGen) && !grabbed) {
         // Any dialog left open (prewarm, a stray click) would swallow the
         // clicks below and the slot click when the moment comes.
@@ -737,19 +831,22 @@
         // and only with auto-Book on: the shot IS an automatic booking.
         var leftMs = msUntilCourtMidnightCorrected();
         var opensTonight = !!cfg.autoBook && ymd(td) === courtYmdPlus(2);
-        if (opensTonight && !directCtl.prepared && directCtl.attempts < 2 &&
-            leftMs <= DIRECT_PREP_LEAD_MS && leftMs > 8000) {
+        var pending = jobs.some(function (j) { return !j.prepared; });
+        if (opensTonight && pending && directCtl.attempts < 2 &&
+            leftMs <= prepLead && leftMs > 9000) {
           directCtl.attempts++;
-          directCtl.prepared = await prepareDirectBooking(td, timeMin, cfg, myGen, function () { return grabbed; });
+          await prepareDirectShots(td, jobs, cfg, myGen, function () { return grabbed; });
           if (!live(myGen) || grabbed) return;
-          if (directCtl.prepared) setStatus("Прямой запрос готов — жду полночь ⚡", "ok");
+          var ready = jobs.filter(function (j) { return j.prepared; });
+          if (ready.length === jobs.length) setStatus("Прямой запрос готов (" + jobTimes(ready) + ") — жду полночь ⚡", "ok");
+          else if (ready.length) setStatus("Готов прямой запрос только для " + jobTimes(ready) + " — остальное обычной схемой", "warn");
           else if (directCtl.attempts >= 2) setStatus("Прямой запрос не собрался — бронирую по обычной схеме", "warn");
           parkedYmd = 0;                    // the sacrificial modal click moved focus
           continue;
         }
         if (opensTonight && !directCtl.scheduled && leftMs <= 6000) {
           directCtl.scheduled = true;
-          scheduleMidnightFire(td, timeMin, cfg, myGen, directCtl, function () { return grabbed; });
+          scheduleMidnightFire(td, jobs, cfg, myGen, function () { return grabbed; });
         }
         if (inTurboWindow()) {
           // Rollover imminent: keep the app fetching so it renders the new day
@@ -763,7 +860,7 @@
         } else {
           if (turboOn) {
             turboOn = false;
-            setStatus("Жду открытия слота " + cfg.targetDate + " " + cfg.targetTime + "…");
+            setStatus("Жду открытия " + jobTimes(jobs) + " на " + cfg.targetDate + "…");
           }
           if (maintenanceAsap || Date.now() >= nextMaint) {
             maintenanceAsap = false;
@@ -813,16 +910,16 @@
   }
   // Fill each field the moment it exists rather than waiting for the whole
   // form: Google renders the name/email/notes inputs in stages.
-  async function fillForm(cfg) {
+  async function fillForm(data) {
     var start = Date.now();
     var end = start + 1500;
     var did = { first: false, last: false, mail: false, note: false };
     while (Date.now() < end) {
       var f = formInputs();
-      if (!did.first && f.texts[0]) { setNativeValue(f.texts[0], cfg.firstName || ""); did.first = true; }
-      if (!did.last && f.texts[1]) { setNativeValue(f.texts[1], cfg.lastName || ""); did.last = true; }
-      if (!did.mail && f.emails[0]) { setNativeValue(f.emails[0], cfg.email || ""); did.mail = true; }
-      if (!did.note && f.areas[0]) { setNativeValue(f.areas[0], cfg.flat || ""); did.note = true; }
+      if (!did.first && f.texts[0]) { setNativeValue(f.texts[0], data.firstName || ""); did.first = true; }
+      if (!did.last && f.texts[1]) { setNativeValue(f.texts[1], data.lastName || ""); did.last = true; }
+      if (!did.mail && f.emails[0]) { setNativeValue(f.emails[0], data.email || ""); did.mail = true; }
+      if (!did.note && f.areas[0]) { setNativeValue(f.areas[0], data.flat || ""); did.note = true; }
       if (did.first && did.last && did.mail && did.note) return true;
       // Last name / notes may simply not exist on this form. Only accept that
       // after a grace period, or a late-rendering field would go unfilled.
@@ -832,8 +929,12 @@
     return did.first && did.mail;
   }
 
-  async function grab(td, timeMin, cfg, myGen) {
-    setStatus("Слот открылся! Бронирую…", "ok");
+  // Book ONE job through the UI. Returns an outcome string; the caller owns
+  // status/notifications/state so a queue of jobs can be reported as a whole:
+  //   ok | captcha | taken | manual | unrendered | noform | unconfirmed | aborted
+  async function grabJob(td, job, cfg, myGen) {
+    var timeMin = job.timeMin;
+    setStatus("Слот " + job.label + " открылся! Бронирую…", "ok");
     // Belt & suspenders: never run the real booking through a swallowed hook.
     toInject("suppress-booking-off");
 
@@ -846,24 +947,29 @@
       var c = findSlotButtons(timeMin).filter(function (b) { return tried.indexOf(b) === -1; });
       return c.length ? c : null;   // null (not []) so waitFor keeps polling
     }
+    // The modal must match the target day AND this job's time — with two jobs
+    // in play, a leftover modal for the other slot must not be filled in here.
+    function modalIsThisJob() {
+      return modalMatchesTarget(td) && !modalShowsOtherTime(timeMin);
+    }
 
     var opened = false;
     var filled = false;
     // An open dialog swallows every click below, so deal with it first. If it
-    // already IS the target's, there's nothing to click — go straight to filling.
+    // already IS this job's, there's nothing to click — go straight to filling.
     if (dialogEl()) {
-      if (modalMatchesTarget(td)) {
+      if (modalIsThisJob()) {
         opened = true;
         setStatus("Заполняю данные…");
-        filled = await fillForm(cfg);
+        filled = await fillForm(job.data);
       } else {
         await closeModal();
       }
-      if (!live(myGen)) return;
+      if (!live(myGen)) return "aborted";
     }
     var deadline = Date.now() + 15000;
     while (Date.now() < deadline && !opened) {
-      if (!live(myGen)) return;
+      if (!live(myGen)) return "aborted";
       // The parked strip already shows the target's column, so the slot button
       // renders in place — no day selection needed. Check what's on screen, then
       // give the app a brief moment: the radar usually beats the DOM by ~200ms,
@@ -880,7 +986,7 @@
       // server-side that the slot is open. Trusting the label here would strand
       // us at exactly the moment the slot opens.
       if (!cands.length && live(myGen)) {
-        await ensureMonth(td); if (!live(myGen)) return;
+        await ensureMonth(td); if (!live(myGen)) return "aborted";
         var cell = dateCellButton(ymd(td));
         if (cell && !cell.disabled && cell.getAttribute("aria-disabled") !== "true") {
           cell.click();
@@ -898,53 +1004,43 @@
         if (!seen) { await refetching; seen = await waitFor(freshCandidates, 400, 40); }
         cands = seen || [];
       }
-      if (!live(myGen)) return;
+      if (!live(myGen)) return "aborted";
       // Try each same-time button; verify the modal is actually the target day
       // (the multi-day column view can show the same time on a neighbouring day).
       for (var i = 0; i < cands.length; i++) {
-        if (!live(myGen)) return;
+        if (!live(myGen)) return "aborted";
         cands[i].click();
         // No dialog at all means the click hit a detached node (a turbo redraw
         // landed between the query and the click) — retry fast instead of
         // sitting out the full modal-open patience below.
         if (!(await waitFor(dialogEl, 800, 30))) continue;
         if (!(await waitFor(modalDateRendered, 2000, 40))) continue;
-        if (!modalMatchesTarget(td)) {    // wrong day -> skip this button from now on
+        if (!modalIsThisJob()) {          // wrong day/time -> skip this button
           tried.push(cands[i]);
           await closeModal();
           continue;
         }
         opened = true;
         setStatus("Заполняю данные…");
-        filled = await fillForm(cfg);     // starts as soon as the first input exists
+        filled = await fillForm(job.data);  // starts as soon as the first input exists
         break;
       }
       if (!opened) await sleep(150);
     }
 
-    if (!live(myGen)) return;
-    if (!opened) {
-      setStatus("Слот не отрисовался вовремя — продолжаю ждать", "warn");
-      if ((await get([STATE_KEY]))[STATE_KEY] === "armed" && live(myGen)) startPolling(myGen);
-      else await setState("idle");
-      return;
-    }
+    if (!live(myGen)) return "aborted";
+    if (!opened) return "unrendered";
 
     if (!filled) {              // late-rendering inputs: one more pass
-      filled = await fillForm(cfg);
-      if (!live(myGen)) return;
-      if (!filled) { setStatus("Поля формы не заполнились — проверь вкладку", "error"); notify("Padel: заполни форму", "Слот открыт, но поля не заполнились. Открой вкладку.", true); await setState("idle"); return; }
+      filled = await fillForm(job.data);
+      if (!live(myGen)) return "aborted";
+      if (!filled) return "noform";
     }
 
-    if (!cfg.autoBook) {
-      setStatus("Форма готова — нажми Book вручную", "warn");
-      notify("Padel: форма готова", "Слот " + cfg.targetTime + " заполнен. Нажми Book.", true);
-      await setState("idle");
-      return;
-    }
+    if (!cfg.autoBook) return "manual";
 
     var book = bookButton();
-    if (!book) { setStatus("Кнопка Book не найдена — стоп", "error"); await setState("idle"); return; }
+    if (!book) return "nobutton";
 
     setStatus("Жму Book…");
     var resultP = nextBookingResult(20000);
@@ -960,38 +1056,111 @@
       if (captchaVisible()) outcome = { kind: "captcha" };
     }
 
-    if (outcome && outcome.kind === "captcha") {
-      setStatus("КАПЧА — нужен ты. Открой вкладку и добей вручную", "error");
-      notify("⚠️ Padel: капча!", "Автобронь остановлена. Открой вкладку календаря и реши капчу вручную.", true);
-      await setState("idle");
-      return;
-    }
-    if (outcome && outcome.kind === "taken") {
-      if (directWon) {
-        // "Taken" by ourselves: the direct shot landed first. Not an error.
-        setStatus("✅ Слот уже забронирован прямым запросом", "ok");
-      } else {
-        setStatus("Слот перехватили раньше нас", "error");
-        notify("Padel: слот перехвачен", "Кто-то успел забронировать " + cfg.targetTime + " первым.", true);
-      }
-      await setState("idle");
-      return;
-    }
+    if (outcome && outcome.kind === "captcha") return "captcha";
+    if (outcome && outcome.kind === "taken") return "taken";
     var ok = (outcome && outcome.kind === "confirmed") ||
              (outcome && outcome.kind === "rpc" && outcome.data && outcome.data.status === 200);
-    if (ok) {
-      setStatus("✅ Слот " + cfg.targetTime + " забронирован!", "ok");
-      notify("✅ Padel забронирован", "Слот " + cfg.targetDate + " " + cfg.targetTime + " успешно занят.", true);
-      await setState("idle");
-    } else if (directWon) {
-      // The UI attempt fizzled, but the direct shot already secured the slot.
-      setStatus("✅ Слот уже забронирован прямым запросом", "ok");
-      await setState("idle");
-    } else {
-      setStatus("Не удалось подтвердить бронь — проверь вкладку", "error");
-      notify("Padel: проверь бронь", "Не удалось автоматически подтвердить результат. Открой вкладку.", true);
-      await setState("idle");
+    return ok ? "ok" : "unconfirmed";
+  }
+
+  // After a booking completes, the page can sit on a confirmation view. Get
+  // back to the slot grid so the next job has something to click.
+  async function backToGrid(myGen) {
+    if (slotButtonsAll().length) return true;
+    await closeModal();
+    if (!live(myGen)) return false;
+    if (slotButtonsAll().length) return true;
+    clickByText(["Done", "Close", "Book another time", "Listo", "Cerrar", "Готово", "Закрыть"]);
+    var seen = await waitFor(function () { return slotButtonsAll().length ? true : null; }, 3000, 80);
+    return !!seen;
+  }
+
+  function reportJob(job, out, cfg) {
+    var when = cfg.targetDate + " " + job.time;
+    if (out === "ok") {
+      setStatus("✅ Слот " + job.label + " забронирован!", "ok");
+      notify("✅ Padel забронирован", "Слот " + when + " успешно занят.", true);
+    } else if (out === "captcha") {
+      setStatus("КАПЧА — нужен ты. Открой вкладку и добей вручную", "error");
+      notify("⚠️ Padel: капча!", "Автобронь остановлена. Открой вкладку календаря и реши капчу вручную.", true);
+    } else if (out === "taken") {
+      if (job.directWon) {
+        // "Taken" by ourselves: our own direct shot landed first. Not an error.
+        setStatus("✅ Слот " + job.label + " уже забронирован прямым запросом", "ok");
+      } else {
+        setStatus("Слот " + job.label + " перехватили раньше нас", "error");
+        notify("Padel: слот перехвачен", "Кто-то успел забронировать " + job.time + " первым.", true);
+      }
+    } else if (out === "manual") {
+      setStatus("Форма готова — нажми Book вручную", "warn");
+      notify("Padel: форма готова", "Слот " + job.time + " заполнен. Нажми Book.", true);
+    } else if (out === "noform") {
+      setStatus("Поля формы не заполнились — проверь вкладку", "error");
+      notify("Padel: заполни форму", "Слот " + job.time + " открыт, но поля не заполнились. Открой вкладку.", true);
+    } else if (out === "nobutton") {
+      setStatus("Кнопка Book не найдена — стоп", "error");
+      notify("Padel: проверь вкладку", "Кнопка Book не найдена для " + job.time + ".", true);
+    } else if (out === "unrendered") {
+      setStatus("Слот " + job.label + " не отрисовался вовремя", "warn");
+    } else if (out === "unconfirmed") {
+      if (job.directWon) {
+        setStatus("✅ Слот " + job.label + " уже забронирован прямым запросом", "ok");
+      } else {
+        setStatus("Не удалось подтвердить бронь " + job.label + " — проверь вкладку", "error");
+        notify("Padel: проверь бронь", "Не удалось подтвердить результат для " + job.time + ". Открой вкладку.", true);
+      }
     }
+  }
+
+  // Work the jobs one at a time — there is a single modal in the DOM, so UI
+  // bookings cannot overlap. Jobs already won by a direct shot are skipped.
+  async function runGrabs(td, jobs, cfg, myGen) {
+    var did = 0;
+    for (var i = 0; i < jobs.length; i++) {
+      var job = jobs[i];
+      if (!live(myGen)) return;
+      if (job.done) continue;
+      if (job.directWon) { job.done = true; job.ok = true; continue; }
+      if (did > 0 && !(await backToGrid(myGen))) {
+        if (!live(myGen)) return;
+        job.done = true;
+        setStatus("Не удалось вернуться к сетке — забронируй " + job.label + " вручную", "error");
+        notify("Padel: добей вручную", "Слот " + job.time + " не забронирован — открой вкладку.", true);
+        continue;
+      }
+      var out = await grabJob(td, job, cfg, myGen);
+      if (!live(myGen) || out === "aborted") return;
+      did++;
+      job.done = true;
+      job.out = out;
+      job.ok = (out === "ok");
+      reportJob(job, out, cfg);
+      // A captcha challenge or a half-filled form blocks everything behind it.
+      if (out === "captcha" || out === "manual" || out === "noform" || out === "nobutton") break;
+    }
+    if (!live(myGen)) return;
+    var okJobs = jobs.filter(function (j) { return j.ok || j.directWon; });
+    if (jobs.length > 1) {
+      setStatus(okJobs.length === jobs.length
+        ? "✅ Забронировано: " + jobTimes(okJobs)
+        : "Забронировано " + okJobs.length + " из " + jobs.length + " (" + jobTimes(okJobs) + ")",
+        okJobs.length === jobs.length ? "ok" : "warn");
+    }
+    // Nothing booked and the only thing that went wrong was a slot failing to
+    // render: detection may have been early, so keep waiting rather than
+    // disarming. Any conclusive outcome (taken, captcha, form trouble) must NOT
+    // re-arm, or we'd wait forever for a slot a rival already holds. Never
+    // re-arm after a success either — rebuilt jobs lose their state and would
+    // book the same slot twice.
+    var conclusive = jobs.some(function (j) { return j.out && j.out !== "unrendered"; });
+    var anyUnrendered = jobs.some(function (j) { return j.out === "unrendered"; });
+    if (!okJobs.length && anyUnrendered && !conclusive &&
+        (await get([STATE_KEY]))[STATE_KEY] === "armed" && live(myGen)) {
+      setStatus("Слот не отрисовался вовремя — продолжаю ждать", "warn");
+      startPolling(myGen);
+      return;
+    }
+    await setState("idle");
   }
 
   async function grabNow(myGen) {
@@ -999,9 +1168,9 @@
     if (!live(myGen)) return;
     var cfg = st[CFG_KEY] || {};
     var td = parseTargetDate(cfg.targetDate);
-    var timeMin = hhmmToMinutes(cfg.targetTime);
-    if (!td || timeMin < 0) { setStatus("Заполни дату и время в popup", "error"); await setState("idle"); return; }
-    await grab(td, timeMin, cfg, myGen);
+    var jobs = buildJobs(cfg);
+    if (!td || !jobs.length) { setStatus("Заполни дату и время в popup", "error"); await setState("idle"); return; }
+    await runGrabs(td, jobs, cfg, myGen);
   }
 
   // ---------- lifecycle ----------

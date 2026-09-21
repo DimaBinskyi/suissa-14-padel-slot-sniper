@@ -41,6 +41,32 @@
       </select>
     </label>
 
+    <label class="check">
+      <input type="checkbox" id="secondOn" />
+      Второй слот — бронировать два одновременно
+    </label>
+    <fieldset id="secondBox" hidden>
+      <legend>Второй слот (та же дата)</legend>
+      <div class="row two">
+        <label>Время
+          <select id="secondTime">
+            <option value="08:30">8:30am</option>
+            <option value="10:00">10:00am</option>
+            <option value="11:30">11:30am</option>
+            <option value="13:00">1:00pm</option>
+            <option value="14:30">2:30pm</option>
+            <option value="16:00">4:00pm</option>
+            <option value="17:30">5:30pm</option>
+            <option value="19:00">7:00pm</option>
+            <option value="20:30">8:30pm</option>
+          </select>
+        </label>
+        <label>Профиль
+          <select id="secondProfile" aria-label="Профиль для второго слота"></select>
+        </label>
+      </div>
+    </fieldset>
+
     <fieldset>
       <legend>Данные для брони</legend>
       <label>Профиль

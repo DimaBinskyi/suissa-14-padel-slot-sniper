@@ -81,6 +81,36 @@ target date opens (and only with auto-Book on), a third worker now runs:
    запросом" instead of treating the slot as stolen, and if a rival got it
    you get a "перехвачен" notification instead of a silent hang.
 
+## Two slots at once (v0.3)
+
+Tick **«Второй слот»** in the popup to book two times on the same date at one
+midnight, each with its own profile (e.g. a different resident). A rollover
+opens exactly one new day, so both jobs share the date and differ in time +
+identity.
+
+The two paths scale very differently, which is the whole point:
+
+- **Direct shot — truly parallel.** Captures are sequential (one modal in the
+  DOM, and a reCAPTCHA token is single-use), so each extra slot pushes the
+  capture lead back by 12 s — `T−20 s` for one slot, `T−32 s` for two. Only the
+  first token pays the full wait. At the rollover **both requests leave in the
+  same tick**, so both bookings land ~one RTT after midnight.
+- **UI fallback — sequential.** One modal at a time: the first slot lands at
+  ~T+0.6 s, the second at ~T+2.5 s. Between jobs it returns to the grid
+  (dismiss dialog → *Done*/*Close* → wait for slot buttons); if the
+  confirmation view can't be dismissed it tells you to finish that one by hand.
+
+Jobs the direct shot already won are skipped by the UI queue, and a modal left
+open by the other slot is never filled in for the wrong job — the 90-minute end
+time in the header (`8:30 – 10:00pm`) identifies which slot a dialog belongs to.
+Notifications and the final status report per slot (`Забронировано 2 из 2`).
+
+Note: firing two booking RPCs in the same millisecond is a stronger bot signal
+than one. Your logs show the schedule accepts two bookings for the same date
+from one session (2026-08-09: 20:30 and 16:00 both booked with one email), so
+separate Google accounts aren't needed — but if challenges start appearing,
+staggering the shots is the first thing to try.
+
 Caveats needing one live pass: the booking RPC body format (epoch replacement
 counts are logged as `direct shot prepared`), whether the token survives ~20 s
 (if Google rejects it, the UI fallback still fires), and the exact
