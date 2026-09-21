@@ -17,8 +17,15 @@
   "use strict";
 
   var SLOTS = "ListAvailableSlots";
-  var SERVICE = "/AppointmentBookingService/";
-  var DEF = "GetAppointmentServiceDefinition";
+  // The real booking RPC, verified against the live page:
+  //   .../$rpc/google.internal.calendar.v1.AppointmentBookingService/BookSlot?...
+  // Note the DOT before the service name. Matching "/AppointmentBookingService/"
+  // with a leading slash never matched anything, so no booking call was ever
+  // classified: the swallow never fired (the capture booked the sacrificial
+  // slot for real) and no booking result was ever reported. Matching the method
+  // by name is also narrow enough to leave CancelBookedSlot and
+  // GetAppointmentServiceDefinition alone, which a service-wide match ate.
+  var BOOK = "AppointmentBookingService/BookSlot";
 
   // Latest captured request template. Refreshed on every app-initiated call so
   // credentials (e.g. SAPISIDHASH, which is time-bound) stay fresh.
@@ -144,7 +151,7 @@
   function classify(url) {
     if (!url) return null;
     if (url.indexOf(SLOTS) !== -1) return "slots";
-    if (url.indexOf(SERVICE) !== -1 && url.indexOf(DEF) === -1) return "book";
+    if (url.indexOf(BOOK) !== -1) return "book";
     return null;
   }
 

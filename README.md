@@ -122,7 +122,17 @@ from one session (2026-08-09: 20:30 and 16:00 both booked with one email), so
 separate Google accounts aren't needed — but if challenges start appearing,
 staggering the shots is the first thing to try.
 
-Caveats needing one live pass: the booking RPC body format (epoch replacement
+**Verified live on 2026-09-21** — a request captured for one slot was retargeted
+to another and accepted (HTTP 200 + booking id), while the sacrificial slot
+stayed free. The booking RPC is
+`.../google.internal.calendar.v1.AppointmentBookingService/BookSlot` (note the
+**dot** before the service name) and its body carries
+`[[<startEpochSeconds>], 90]` — a start epoch in **seconds** plus a duration in
+minutes, so only the seconds-form start is rewritten and there is no end epoch
+to match. Auth rides on cookies, which is why the replay needs
+`credentials: "include"` and only one request header.
+
+Older caveats, now settled: the booking RPC body format (epoch replacement
 counts are logged as `direct shot prepared`), whether the token survives ~20 s
 (if Google rejects it, the UI fallback still fires), and the exact
 "no longer available" wording for fail-fast detection. Keep the calendar tab
