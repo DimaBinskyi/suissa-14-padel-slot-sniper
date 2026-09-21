@@ -385,9 +385,17 @@
     return slotButtonsAll().filter(function (b) { return slotTextToMinutes(b.textContent) === timeMin; });
   }
 
+  // The LAST visible dialog, never the first.
+  //
+  // Measured on the live page: clicking a second slot while a modal is open
+  // STACKS a new [role=dialog] instead of swapping the existing one — both end
+  // up visible at the same position, each with its own form and Book button.
+  // querySelector() returns the stale one, so filling and submitting through it
+  // would book the slot the user is no longer looking at.
   function dialogEl() {
-    var d = document.querySelector('[role="dialog"]');
-    return (d && visible(d)) ? d : null;
+    var all = document.querySelectorAll('[role="dialog"]');
+    for (var i = all.length - 1; i >= 0; i--) if (visible(all[i])) return all[i];
+    return null;
   }
   function dialogScope() { return dialogEl() || document; }
   function formInputs() {
@@ -458,16 +466,25 @@
     var scope = dialogEl() || document.body;
     return /no longer available|not available anymore|ya no está disponible/i.test(scope.textContent || "");
   }
-  function clickByText(labels) {
-    var btns = document.querySelectorAll("button");
+  // Skips disabled buttons: Cancel is disabled while a booking is submitting
+  // (measured on the live page), and clicking it would silently do nothing
+  // while we counted it as a successful close.
+  function clickByText(labels, scope) {
+    var btns = (scope || document).querySelectorAll("button");
     for (var i = 0; i < btns.length; i++) {
-      var t = (btns[i].textContent || "").trim();
-      if (visible(btns[i]) && labels.indexOf(t) !== -1) { btns[i].click(); return true; }
+      var b = btns[i];
+      var t = (b.textContent || "").trim();
+      if (!visible(b) || labels.indexOf(t) === -1) continue;
+      if (b.disabled || b.getAttribute("aria-disabled") === "true") continue;
+      b.click();
+      return true;
     }
     return false;
   }
   async function closeModal() {
-    clickByText(["Cancel", "Cancelar", "Отмена"]);
+    // Scoped to the topmost dialog: with dialogs stacked, an unscoped search
+    // would hit the buried one's Cancel and leave the visible one open.
+    clickByText(["Cancel", "Cancelar", "Отмена"], dialogEl() || document);
     await sleep(250);
     clickByText(["Discard", "Descartar", "Отменить изменения"]); // "discard unsaved changes" confirm
     await sleep(200);
@@ -514,10 +531,15 @@
     }
     return false;
   }
+  // Verified live: a completed booking renders "Booking confirmed" + "Email
+  // sent to <address>" in the dialog. Scoped to the CURRENT dialog because
+  // dialogs stack — otherwise the first job's confirmation text, still in the
+  // document, would resolve the second job's wait as if it had succeeded.
   function bookingConfirmed() {
     if (formIsOpen()) return false;
-    var body = (document.body.textContent || "").toLowerCase();
-    return /you'?re booked|booking confirmed|reserva confirmada|has reservado|cita reservada|added to your calendar/.test(body);
+    var scope = dialogEl() || document.body;
+    var txt = (scope.textContent || "").toLowerCase();
+    return /you'?re booked|booking confirmed|reserva confirmada|has reservado|cita reservada|added to your calendar/.test(txt);
   }
   function notify(title, message, sound) {
     log("notify:", title, "|", message);
