@@ -4,7 +4,7 @@
 //   idle  -> do nothing
 //   armed -> on the rollover night, a third worker joins the two below: the
 //            DIRECT SHOT (see prepareDirectBooking) captures the page's own
-//            booking request (with its fresh reCAPTCHA token) ~75s before
+//            booking request (with its fresh reCAPTCHA token) ~45s before
 //            server-corrected midnight, retargets it to the wanted slot, and
 //            fires it ~120ms after the rollover — one RTT instead of the ~0.5s
 //            UI path. The UI grab runs independently in parallel.
@@ -529,11 +529,13 @@
   var TURBO_TAIL_MS = 60000;   // keep going after it
   var TURBO_POKE_MS = 600;     // how often to make the app refetch
   var TURBO_REPLAY_MS = 600;   // radar cadence while turbo is poking
-  // Direct shot: build the booking request this early (the reCAPTCHA token
-  // inside lives ~120s, so don't raise past ~90s), fire it this long after
-  // corrected midnight (cushion for residual clock error — too early and the
-  // server rejects it AND the single-use token is spent).
-  var DIRECT_PREP_LEAD_MS = 75000;
+  // Direct shot: build the booking request this early. Later = younger token
+  // at fire time (~45s old; TTL is ~120s), but it must leave room for one
+  // retry and a challenge before the turbo window — don't push below ~30s.
+  // Fire this long after corrected midnight (cushion for residual clock
+  // error — too early and the server rejects it AND the single-use token is
+  // spent).
+  var DIRECT_PREP_LEAD_MS = 45000;
   var DIRECT_SEND_DELAY_MS = 120;
   function inTurboWindow() {
     var left = msUntilCourtMidnightCorrected();
@@ -594,11 +596,15 @@
       if ((!cap || !cap.ok) && captchaVisible()) {
         // A challenge fired on the warm-up click. The human can still save the
         // night: solving it makes the page finish building the request, which
-        // we capture as usual. Keep the swallow alive while they solve.
-        toInject({ cmd: "suppress-extend", ttl: 60000 });
-        setStatus("Капча на прогреве! Реши её — токен нужен до полуночи", "error");
-        notify("⚠️ Padel: капча на прогреве", "Реши капчу в открытой вкладке календаря — прямой запрос ждёт токен.", true);
-        cap = await awaitMsg(captureWaiters, 45000);
+        // we capture as usual. Keep the swallow alive while they solve — but
+        // only for the time actually left before the fire moment.
+        var solveMs = Math.min(45000, msUntilCourtMidnightCorrected() - 8000);
+        if (solveMs > 3000) {
+          toInject({ cmd: "suppress-extend", ttl: solveMs + 10000 });
+          setStatus("Капча на прогреве! Реши её — токен нужен до полуночи", "error");
+          notify("⚠️ Padel: капча на прогреве", "Реши капчу в открытой вкладке календаря — прямой запрос ждёт токен.", true);
+          cap = await awaitMsg(captureWaiters, solveMs);
+        }
       }
       await closeModal();
       if (!cap || !cap.ok) { log("direct prep: booking request was not captured"); return false; }
@@ -731,7 +737,7 @@
         var leftMs = msUntilCourtMidnightCorrected();
         var opensTonight = !!cfg.autoBook && ymd(td) === courtYmdPlus(2);
         if (opensTonight && !directCtl.prepared && directCtl.attempts < 2 &&
-            leftMs <= DIRECT_PREP_LEAD_MS && leftMs > 35000) {
+            leftMs <= DIRECT_PREP_LEAD_MS && leftMs > 20000) {
           directCtl.attempts++;
           directCtl.prepared = await prepareDirectBooking(td, timeMin, cfg, myGen, function () { return grabbed; });
           if (!live(myGen) || grabbed) return;
