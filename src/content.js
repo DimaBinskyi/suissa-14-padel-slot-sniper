@@ -2,6 +2,12 @@
 //
 // States (persisted in chrome.storage.local under "state"):
 //   idle  -> do nothing
+//   armed -> on the rollover night, a third worker joins the two below: the
+//            DIRECT SHOT (see prepareDirectBooking) captures the page's own
+//            booking request (with its fresh reCAPTCHA token) ~75s before
+//            server-corrected midnight, retargets it to the wanted slot, and
+//            fires it ~120ms after the rollover — one RTT instead of the ~0.5s
+//            UI path. The UI grab stays armed as a gated fallback.
 //   armed -> two independent workers:
 //            * replay radar: re-send the captured ListAvailableSlots request
 //              every ~300ms and check each response for the EXACT target slot
@@ -40,8 +46,18 @@
   // ---------- inject bridge ----------
   var slotWaiters = [];      // resolved by REPLAYED responses only
   var bookingWaiters = [];
+  var captureWaiters = [];   // resolved when inject captures a booking template
+  var suppressWaiters = [];  // resolved when inject acks suppress-booking-on
+  var preparedWaiters = [];  // resolved when inject finishes prepare-direct
+  var directWaiters = [];    // resolved by a direct-book result
   var lastAppSlots = { body: "", ts: 0 }; // latest APP-initiated ListAvailableSlots response
   var onSlotsBody = null;    // armed-mode hook: called with EVERY availability body on arrival
+
+  function flushWaiters(list, d) {
+    var w = list.slice();
+    list.length = 0;
+    w.forEach(function (fn) { fn(d); });
+  }
 
   window.addEventListener("message", function (e) {
     if (e.source !== window) return;
@@ -49,19 +65,41 @@
     if (!d || d.__padel !== "inject") return;
     if (d.type === "slots") {
       if (d.replayed) {
-        var w = slotWaiters; slotWaiters = [];
-        w.forEach(function (fn) { fn(d); });
+        if (d.dateHeader) noteClockSample(d.dateHeader, d.tSent, d.tRecv);
+        flushWaiters(slotWaiters, d);
       } else {
         lastAppSlots = { body: d.body || "", ts: Date.now() };
       }
       if (onSlotsBody) onSlotsBody(d.body || "");
     } else if (d.type === "booking-result") {
-      var b = bookingWaiters; bookingWaiters = [];
-      b.forEach(function (fn) { fn(d); });
+      flushWaiters(bookingWaiters, d);
+    } else if (d.type === "booking-captured") {
+      flushWaiters(captureWaiters, d);
+    } else if (d.type === "suppress-ack") {
+      flushWaiters(suppressWaiters, d);
+    } else if (d.type === "direct-prepared") {
+      flushWaiters(preparedWaiters, d);
+    } else if (d.type === "direct-book-result") {
+      flushWaiters(directWaiters, d);
     }
   });
 
-  function toInject(cmd) { window.postMessage({ __padel: "content", cmd: cmd }, "*"); }
+  function toInject(msg) {
+    if (typeof msg === "string") msg = { cmd: msg };
+    msg.__padel = "content";
+    window.postMessage(msg, "*");
+  }
+
+  // Wait for the next message flushed into `list`; optionally fire the request
+  // that should produce it. Resolves null on timeout.
+  function awaitMsg(list, timeoutMs, sendFn) {
+    return new Promise(function (res) {
+      var done = false;
+      var t = setTimeout(function () { if (!done) { done = true; res(null); } }, timeoutMs);
+      list.push(function (d) { if (!done) { done = true; clearTimeout(t); res(d); } });
+      if (sendFn) sendFn();
+    });
+  }
 
   function replayOnce(timeoutMs) {
     return new Promise(function (res) {
@@ -136,6 +174,41 @@
     fmt.formatToParts(new Date()).forEach(function (x) { p[x.type] = x.value; });
     var secs = ((+p.hour) % 24) * 3600 + (+p.minute) * 60 + (+p.second);
     return (86400 - secs) * 1000;
+  }
+  // ---------- server clock sync ----------
+  // The rollover happens on GOOGLE's clock, not this machine's. Every replayed
+  // availability response carries a Date header; an NTP-style estimate against
+  // the request's midpoint (header second + 500ms to undo truncation) gives
+  // offset = serverNow - localNow, good to a few hundred ms — enough to
+  // SCHEDULE the midnight shot instead of discovering the rollover by polling.
+  var clockOffsets = [];
+  function noteClockSample(dateHeader, tSent, tRecv) {
+    var s = Date.parse(dateHeader || "");
+    if (!s || !tSent || !tRecv) return;
+    var rtt = tRecv - tSent;
+    if (rtt < 0 || rtt > 2000) return; // stalled request — poisoned sample
+    clockOffsets.push((s + 500) - (tSent + tRecv) / 2);
+    if (clockOffsets.length > 15) clockOffsets.shift();
+  }
+  function clockOffset() {
+    if (!clockOffsets.length) return 0;
+    var a = clockOffsets.slice().sort(function (x, y) { return x - y; });
+    return a[Math.floor(a.length / 2)];
+  }
+  // msUntilCourtMidnight truncates to the second; add the local sub-second part
+  // back (tz offsets are whole minutes, so second boundaries coincide) and
+  // shift by the server offset.
+  function msUntilCourtMidnightCorrected() {
+    return msUntilCourtMidnight() - (Date.now() % 1000) - clockOffset();
+  }
+  // Court-timezone date `days` ahead as "YYYYMMDD". The upcoming midnight
+  // rollover opens courtYmdPlus(2): entering day X+1 reveals day X+2.
+  function courtYmdPlus(days) {
+    var fmt = new Intl.DateTimeFormat("en-GB", { timeZone: COURT_TZ, year: "numeric", month: "2-digit", day: "2-digit" });
+    var p = {};
+    fmt.formatToParts(new Date()).forEach(function (x) { p[x.type] = x.value; });
+    var dt = new Date(Date.UTC(+p.year, +p.month - 1, +p.day + days));
+    return "" + dt.getUTCFullYear() + pad(dt.getUTCMonth() + 1) + pad(dt.getUTCDate());
   }
   function bodiesContainTarget(bodies, td, timeMin) {
     var cands = targetEpochCandidates(td, timeMin);
@@ -246,6 +319,26 @@
     if (!dlg) return false;
     var txt = (dlg.textContent || "");
     return new RegExp(MONTHS[td.m - 1] + "\\s+" + td.d + "\\b").test(txt);
+  }
+  // "Wednesday, July 8, 4:00 – 5:30pm" -> {y,m,d}. The header has no year, but
+  // bookable dates are never more than a couple of days out, so pick the year
+  // that puts the date near today.
+  function parseModalDate() {
+    var dlg = dialogEl();
+    if (!dlg) return null;
+    var m = (dlg.textContent || "").match(new RegExp("(" + MONTHS.join("|") + ")\\s+(\\d{1,2})\\b"));
+    if (!m) return null;
+    var mo = MONTHS.indexOf(m[1]) + 1, day = +m[2], y = new Date().getFullYear();
+    var diff = new Date(y, mo - 1, day).getTime() - Date.now();
+    if (diff < -45 * 86400000) y++;
+    if (diff > 320 * 86400000) y--;
+    return { y: y, m: mo, d: day };
+  }
+  // Booking raced and lost: Google swaps the modal to a "time is no longer
+  // available" notice. Spotting it beats waiting out the 20s result race.
+  function slotTakenText() {
+    var scope = dialogEl() || document.body;
+    return /no longer available|not available anymore|ya no está disponible/i.test(scope.textContent || "");
   }
   function clickByText(labels) {
     var btns = document.querySelectorAll("button");
@@ -436,9 +529,160 @@
   var TURBO_TAIL_MS = 60000;   // keep going after it
   var TURBO_POKE_MS = 600;     // how often to make the app refetch
   var TURBO_REPLAY_MS = 600;   // radar cadence while turbo is poking
+  // Direct shot: build the booking request this early (the reCAPTCHA token
+  // inside lives ~120s, so don't raise past ~90s), fire it this long after
+  // corrected midnight (cushion for residual clock error — too early and the
+  // server rejects it AND the single-use token is spent).
+  var DIRECT_PREP_LEAD_MS = 75000;
+  var DIRECT_SEND_DELAY_MS = 120;
   function inTurboWindow() {
-    var left = msUntilCourtMidnight();
+    var left = msUntilCourtMidnightCorrected();
     return left <= TURBO_LEAD_MS || left >= 86400000 - TURBO_TAIL_MS;
+  }
+
+  // ---------- direct shot ----------
+  // The UI grab costs ~0.5s after the rollover (detect -> render -> click ->
+  // fill -> Book) — and yesterday that lost the race. The direct shot removes
+  // all of it: shortly before midnight we let the page build a COMPLETE booking
+  // request for a sacrificial already-open slot (real form data, real Book
+  // click, so the page mints its own reCAPTCHA token), swallow it before it
+  // reaches the network, rewrite the slot epochs to the target, and fire it at
+  // corrected midnight — the booking arrives one RTT after the rollover. The
+  // UI grab keeps running as a fallback, gated so both can never book at once.
+  var directGatePromise = null, directGateResolve = null;
+  function armDirectGate() {
+    directGatePromise = new Promise(function (r) { directGateResolve = r; });
+  }
+  function resolveDirectGate(v) {
+    if (directGateResolve) { directGateResolve(v); directGateResolve = null; }
+  }
+
+  async function prepareDirectBooking(td, timeMin, cfg, myGen, isGrabbed) {
+    try {
+      setStatus("Готовлю прямой запрос (шаблон + токен)…");
+      if (dialogEl()) { await closeModal(); if (!live(myGen) || isGrabbed()) return false; }
+      var all = slotButtonsAll();
+      if (!all.length) { log("direct prep: no slot buttons on screen"); return false; }
+      var btn = all[0];
+      var btnMin = slotTextToMinutes(btn.textContent);
+      btn.click();
+      if (!(await waitFor(formIsOpen, 4000, 60)) || !(await waitFor(modalDateRendered, 3000, 50))) {
+        log("direct prep: sacrificial modal did not open");
+        await closeModal();
+        return false;
+      }
+      if (!live(myGen) || isGrabbed()) { await closeModal(); return false; }
+      var pd = parseModalDate();
+      if (!pd || btnMin < 0) { log("direct prep: could not read sacrificial date/time"); await closeModal(); return false; }
+      var pCand = targetEpochCandidates(pd, btnMin);
+      var tCand = targetEpochCandidates(td, timeMin);
+      var pMs = parseInt(pCand[0], 10), tMs = parseInt(tCand[0], 10);
+      if (!pMs || !tMs || pMs === tMs) { log("direct prep: bad epochs", pMs, tMs); await closeModal(); return false; }
+      if (!(await fillForm(cfg))) { log("direct prep: form did not fill"); await closeModal(); return false; }
+      if (!live(myGen) || isGrabbed()) { await closeModal(); return false; }
+      // Arm the swallow and WAIT for the ack: the Book click below can reach
+      // xhr.send synchronously, before an unacked postMessage would arrive —
+      // and then the sacrificial slot would get booked for real.
+      var ack = await awaitMsg(suppressWaiters, 1500, function () {
+        toInject({ cmd: "suppress-booking-on", needle: cfg.email || "" });
+      });
+      if (!ack) { log("direct prep: no suppress ack"); await closeModal(); return false; }
+      var book = bookButton();
+      if (!book) { log("direct prep: no Book button"); await closeModal(); return false; }
+      var capP = awaitMsg(captureWaiters, 6000);
+      book.click();
+      var cap = await capP;
+      if ((!cap || !cap.ok) && captchaVisible()) {
+        // A challenge fired on the warm-up click. The human can still save the
+        // night: solving it makes the page finish building the request, which
+        // we capture as usual. Keep the swallow alive while they solve.
+        toInject({ cmd: "suppress-extend", ttl: 60000 });
+        setStatus("Капча на прогреве! Реши её — токен нужен до полуночи", "error");
+        notify("⚠️ Padel: капча на прогреве", "Реши капчу в открытой вкладке календаря — прямой запрос ждёт токен.", true);
+        cap = await awaitMsg(captureWaiters, 45000);
+      }
+      await closeModal();
+      if (!cap || !cap.ok) { log("direct prep: booking request was not captured"); return false; }
+      var DUR = 5400000; // every court slot is 90 min
+      var repl = [
+        [String(pMs), String(tMs)],
+        [String(pMs + DUR), String(tMs + DUR)],
+        [String(Math.floor(pMs / 1000)), String(Math.floor(tMs / 1000))],
+        [String(Math.floor((pMs + DUR) / 1000)), String(Math.floor((tMs + DUR) / 1000))],
+        [ymd(pd), ymd(td)]
+      ];
+      var prep = await awaitMsg(preparedWaiters, 3000, function () {
+        toInject({ cmd: "prepare-direct", repl: repl });
+      });
+      if (!prep || !prep.ok) { log("direct prep: epoch rewrite failed", prep && prep.counts); return false; }
+      log("direct shot prepared, replacement counts:", prep.counts);
+      return true;
+    } catch (e) {
+      log("direct prep error", e);
+      return false;
+    } finally {
+      // NEVER leave the hook swallowing bookings — it would eat a real Book
+      // click later. (The modal is already closed on every path above.)
+      toInject("suppress-booking-off");
+    }
+  }
+
+  async function scheduleMidnightFire(td, timeMin, cfg, myGen, ctl, isGrabbed) {
+    // Arm the gate BEFORE the spin: a grab triggered in the first ms after
+    // rollover must find it and wait for the shot's outcome, not race past it.
+    if (ctl.prepared) armDirectGate();
+    var fireAt = Date.now() + msUntilCourtMidnightCorrected() + DIRECT_SEND_DELAY_MS;
+    while (Date.now() < fireAt) {
+      if (!live(myGen) || isGrabbed()) { resolveDirectGate("lost"); return; }
+      await sleep(Math.min(40, Math.max(4, fireAt - Date.now())));
+    }
+    if (!live(myGen)) { resolveDirectGate("lost"); return; }
+    // The shot goes out first — every ms counts — then the fallback burst:
+    // select the target day so the app fetches/renders it, and give the radar
+    // immediate samples instead of waiting out its cadence.
+    var resP = null;
+    if (ctl.prepared) {
+      resP = awaitMsg(directWaiters, 4000, function () { toInject("direct-book"); });
+      setStatus("Полночь — прямой запрос ушёл ⚡");
+    }
+    if (!isGrabbed()) {
+      var cell = dateCellButton(ymd(td));
+      if (cell && !cell.disabled && cell.getAttribute("aria-disabled") !== "true") cell.click();
+      toInject("replay");
+      setTimeout(function () { if (live(myGen)) toInject("replay"); }, 150);
+      setTimeout(function () { if (live(myGen)) toInject("replay"); }, 320);
+    }
+    if (!resP) return;
+    var res = await resP;
+    if (!live(myGen)) { resolveDirectGate("lost"); return; }
+    if (!(res && res.status === 200)) {
+      // Fail fast: release the UI grab immediately, don't spend its head start.
+      resolveDirectGate("lost");
+      log("direct shot failed (status " + (res && res.status) + " " + (res && res.error || "") + ") — UI grab continues");
+      // If the slot is ALSO gone from availability, a rival got it — say so.
+      await sleep(1500);
+      if (!live(myGen) || isGrabbed()) return;
+      var gone = await replayOnce(1600);
+      if (gone && gone.body && !bodiesContainTarget([gone.body], td, timeMin)) {
+        setStatus("Слот перехватили раньше нас", "error");
+        notify("Padel: слот перехвачен", "Кто-то забронировал " + cfg.targetTime + " первым.", true);
+        await setState("idle");
+      }
+      return;
+    }
+    // 200 can still hide an in-body error; believe it only once availability
+    // confirms the slot is gone. If it's still open, let the UI grab take it.
+    var chk = await replayOnce(1600);
+    var won = !(chk && chk.body && bodiesContainTarget([chk.body], td, timeMin));
+    if (won) {
+      resolveDirectGate("won");
+      setStatus("✅ Слот " + cfg.targetTime + " забронирован прямым запросом!", "ok");
+      notify("✅ Padel забронирован", "Слот " + cfg.targetDate + " " + cfg.targetTime + " занят прямым запросом. Проверь почту.", true);
+      await setState("idle");
+    } else {
+      resolveDirectGate("lost");
+      log("direct shot got 200 but the slot is still open — UI grab continues");
+    }
   }
 
   async function startPolling(myGen) {
@@ -449,6 +693,8 @@
     var timeMin = hhmmToMinutes(cfg.targetTime);
     if (!td || timeMin < 0) { setStatus("Заполни дату и время в popup", "error"); return; }
 
+    directGatePromise = null;
+    directGateResolve = null;
     setStatus("Жду открытия слота " + cfg.targetDate + " " + cfg.targetTime + " (радар " + REPLAY_MS + "мс)…");
 
     var grabbed = false;
@@ -479,11 +725,31 @@
       parkedYmd = 0;                        // the prewarm click moved the view
       var nextMaint = Date.now() + MAINTENANCE_MS;
       var turboOn = false;
+      var directCtl = { attempts: 0, prepared: false, scheduled: false };
       while (live(myGen) && !grabbed) {
         // Any dialog left open (prewarm, a stray click) would swallow the
         // clicks below and the slot click when the moment comes.
         if (dialogEl()) { await closeModal(); if (!live(myGen) || grabbed) return; }
         await ensureMonth(td); if (!live(myGen) || grabbed) return;
+        // Direct shot: only on the night whose rollover actually opens the
+        // target date — firing it a night early would just spend the token —
+        // and only with auto-Book on: the shot IS an automatic booking.
+        var leftMs = msUntilCourtMidnightCorrected();
+        var opensTonight = !!cfg.autoBook && ymd(td) === courtYmdPlus(2);
+        if (opensTonight && !directCtl.prepared && directCtl.attempts < 2 &&
+            leftMs <= DIRECT_PREP_LEAD_MS && leftMs > 35000) {
+          directCtl.attempts++;
+          directCtl.prepared = await prepareDirectBooking(td, timeMin, cfg, myGen, function () { return grabbed; });
+          if (!live(myGen) || grabbed) return;
+          if (directCtl.prepared) setStatus("Прямой запрос готов — жду полночь ⚡", "ok");
+          else if (directCtl.attempts >= 2) setStatus("Прямой запрос не собрался — бронирую по обычной схеме", "warn");
+          parkedYmd = 0;                    // the sacrificial modal click moved focus
+          continue;
+        }
+        if (opensTonight && !directCtl.scheduled && leftMs <= 6000) {
+          directCtl.scheduled = true;
+          scheduleMidnightFire(td, timeMin, cfg, myGen, directCtl, function () { return grabbed; });
+        }
         if (inTurboWindow()) {
           // Rollover imminent: keep the app fetching so it renders the new day
           // on its own — no post-detection redraw to wait out.
@@ -567,6 +833,8 @@
 
   async function grab(td, timeMin, cfg, myGen) {
     setStatus("Слот открылся! Бронирую…", "ok");
+    // Belt & suspenders: never run the real booking through a swallowed hook.
+    toInject("suppress-booking-off");
 
     // Buttons that already opened a WRONG-day modal. Without this, a same-time
     // slot on a neighbouring day would be clicked again every iteration
@@ -674,6 +942,14 @@
       return;
     }
 
+    // If the direct shot is in flight, ITS outcome decides — clicking Book here
+    // too could double-book. Wait briefly; on timeout assume it lost and go.
+    if (directGatePromise) {
+      var dg = await Promise.race([directGatePromise, sleep(2200).then(function () { return null; })]);
+      if (!live(myGen)) return;
+      if (dg === "won") { await closeModal(); return; }
+    }
+
     var book = bookButton();
     if (!book) { setStatus("Кнопка Book не найдена — стоп", "error"); await setState("idle"); return; }
 
@@ -684,7 +960,8 @@
     var outcome = await Promise.race([
       resultP.then(function (r) { return { kind: "rpc", data: r }; }),
       waitFor(captchaVisible, 20000, 300).then(function (v) { return v ? { kind: "captcha" } : null; }),
-      waitFor(bookingConfirmed, 20000, 400).then(function (v) { return v ? { kind: "confirmed" } : null; })
+      waitFor(bookingConfirmed, 20000, 400).then(function (v) { return v ? { kind: "confirmed" } : null; }),
+      waitFor(slotTakenText, 20000, 250).then(function (v) { return v ? { kind: "taken" } : null; })
     ]);
     if (!outcome || (outcome.kind === "rpc" && outcome.data && outcome.data.status !== 200)) {
       if (captchaVisible()) outcome = { kind: "captcha" };
@@ -693,6 +970,12 @@
     if (outcome && outcome.kind === "captcha") {
       setStatus("КАПЧА — нужен ты. Открой вкладку и добей вручную", "error");
       notify("⚠️ Padel: капча!", "Автобронь остановлена. Открой вкладку календаря и реши капчу вручную.", true);
+      await setState("idle");
+      return;
+    }
+    if (outcome && outcome.kind === "taken") {
+      setStatus("Слот перехватили раньше нас", "error");
+      notify("Padel: слот перехвачен", "Кто-то успел забронировать " + cfg.targetTime + " первым.", true);
       await setState("idle");
       return;
     }
