@@ -166,13 +166,34 @@
   // timezone (Europe/Madrid) so it works regardless of the Mac's timezone/DST.
   // ListAvailableSlots encodes slot starts as unix seconds.
   var COURT_TZ = "Europe/Madrid";
+  // Building an Intl.DateTimeFormat costs ~27µs; these run on every
+  // availability response (~3/s all night) and on every log line, so the
+  // formatters are built once and reused.
+  var FMT_MINUTE = new Intl.DateTimeFormat("en-GB", {
+    timeZone: COURT_TZ, hour12: false,
+    year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit"
+  });
+  var FMT_CLOCK = new Intl.DateTimeFormat("en-GB", {
+    timeZone: COURT_TZ, hour12: false,
+    hour: "2-digit", minute: "2-digit", second: "2-digit"
+  });
+  var FMT_DAY = new Intl.DateTimeFormat("en-GB", {
+    timeZone: COURT_TZ, year: "numeric", month: "2-digit", day: "2-digit"
+  });
+  // The candidates for a given slot never change, and the detector compares
+  // against them on every response — memoise per target.
+  var epochCache = {};
   function targetEpochCandidates(td, timeMin) {
+    var key = ymd(td) + "@" + timeMin;
+    if (epochCache[key]) return epochCache[key];
+    var out = targetEpochCandidatesUncached(td, timeMin);
+    epochCache[key] = out;
+    return out;
+  }
+  function targetEpochCandidatesUncached(td, timeMin) {
     var hh = Math.floor(timeMin / 60), mm = timeMin % 60;
     var want = td.y + "-" + pad(td.m) + "-" + pad(td.d) + " " + pad(hh) + ":" + pad(mm);
-    var fmt = new Intl.DateTimeFormat("en-GB", {
-      timeZone: COURT_TZ, hour12: false,
-      year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit"
-    });
+    var fmt = FMT_MINUTE;
     var out = [];
     [2, 1].forEach(function (off) { // CEST (+2) then CET (+1)
       var ms = Date.UTC(td.y, td.m - 1, td.d, hh - off, mm, 0, 0);
@@ -191,12 +212,8 @@
   // is when the new day's slots appear. Knowing how far off that is lets us keep
   // the calendar hot right before it — see the turbo window in startPolling().
   function msUntilCourtMidnight() {
-    var fmt = new Intl.DateTimeFormat("en-GB", {
-      timeZone: COURT_TZ, hour12: false,
-      hour: "2-digit", minute: "2-digit", second: "2-digit"
-    });
     var p = {};
-    fmt.formatToParts(new Date()).forEach(function (x) { p[x.type] = x.value; });
+    FMT_CLOCK.formatToParts(new Date()).forEach(function (x) { p[x.type] = x.value; });
     var secs = ((+p.hour) % 24) * 3600 + (+p.minute) * 60 + (+p.second);
     return (86400 - secs) * 1000;
   }
@@ -238,9 +255,8 @@
   // Court-timezone date `days` ahead as "YYYYMMDD". The upcoming midnight
   // rollover opens courtYmdPlus(2): entering day X+1 reveals day X+2.
   function courtYmdPlus(days) {
-    var fmt = new Intl.DateTimeFormat("en-GB", { timeZone: COURT_TZ, year: "numeric", month: "2-digit", day: "2-digit" });
     var p = {};
-    fmt.formatToParts(new Date()).forEach(function (x) { p[x.type] = x.value; });
+    FMT_DAY.formatToParts(new Date()).forEach(function (x) { p[x.type] = x.value; });
     var dt = new Date(Date.UTC(+p.year, +p.month - 1, +p.day + days));
     return "" + dt.getUTCFullYear() + pad(dt.getUTCMonth() + 1) + pad(dt.getUTCDate());
   }
@@ -629,6 +645,15 @@
   // full wait; later ones are younger.
   var DIRECT_PREP_PER_JOB_MS = 12000;
   function directPrepLeadMs(n) { return DIRECT_PREP_LEAD_MS + Math.max(0, n - 1) * DIRECT_PREP_PER_JOB_MS; }
+  // One thread for everything: hold all DOM work away from the fire moment.
+  var FIRE_QUIET_MS = 250;      // turbo poker stands still within this of the send
+  var FIRE_BURST_DELAY_MS = 60; // fallback burst waits this long after the send
+  var fireAtMs = 0;             // absolute local ms of the planned send
+  function inFireQuietWindow() {
+    if (!fireAtMs) return false;
+    var d = Date.now() - fireAtMs;
+    return d > -FIRE_QUIET_MS && d < FIRE_QUIET_MS;
+  }
   var DIRECT_SEND_DELAY_MS = 120;
   function inTurboWindow() {
     var left = msUntilCourtMidnightCorrected();
@@ -737,47 +762,57 @@
     }
   }
 
+  // Everything in here is about ONE thread. The page, inject.js and this script
+  // all run on the renderer's main thread, so any DOM work we do at midnight —
+  // a date click runs Google's own handlers synchronously and can re-render the
+  // whole grid — delays our own request. Two rules follow:
+  //   1. inject gets the deadline SECONDS in advance and fires from its own
+  //      timer (see arm-fire). A "fire now" postMessage would cost an
+  //      event-loop turn and could queue behind the app's rendering.
+  //   2. Nothing we control touches the DOM until the shots are out: the
+  //      fallback burst is deferred past the fire moment, and the turbo poker
+  //      holds still in a quiet window around it.
   async function scheduleMidnightFire(td, jobs, cfg, myGen, isGrabbed) {
     var fireAt = Date.now() + msUntilCourtMidnightCorrected() + DIRECT_SEND_DELAY_MS;
+    fireAtMs = fireAt;
+    var armed = jobs.filter(function (j) { return j.prepared; });
     log("midnight fire scheduled in " + (fireAt - Date.now()) + "ms " +
         "(clock offset " + Math.round(clockOffset()) + "ms, send delay " + DIRECT_SEND_DELAY_MS + "ms), armed jobs: " +
-        (jobTimes(jobs.filter(function (j) { return j.prepared; })) || "none"));
-    while (Date.now() < fireAt) {
-      if (!live(myGen) || isGrabbed()) { log("fire cancelled before midnight (grab already running or disarmed)"); return; }
-      await sleep(Math.min(40, Math.max(4, fireAt - Date.now())));
-    }
-    if (!live(myGen)) return;
-    log("FIRE (scheduled drift " + (Date.now() - fireAt) + "ms)");
-    // The shots go out first — every ms counts — then the fallback burst:
-    // select the target day so the app fetches/renders it, and give the radar
-    // immediate samples instead of waiting out its cadence.
-    var armed = jobs.filter(function (j) { return j.prepared; });
-    var sentAt = Date.now();
+        (jobTimes(armed) || "none"));
+
+    // Result waiters first, then arm: the reply can arrive one RTT after the
+    // deadline, which may be sooner than this function is resumed.
     var shots = armed.map(function (j) {
-      // All shots leave in the same tick: two slots are booked truly in
-      // parallel, each arriving one RTT after the rollover.
-      return awaitMsg(directWaiters, 4000, function () {
-        log("direct-book sent for " + j.label);
-        toInject({ cmd: "direct-book", id: j.id });
-      }, byId(j.id)).then(function (res) {
-        log("direct-book result for " + j.label + ": status " + ((res && res.status) || "timeout") +
-            " after " + (Date.now() - sentAt) + "ms" + ((res && res.error) ? " error=" + res.error : "") +
-            ((res && res.body) ? " body=" + String(res.body).slice(0, 200) : ""));
-        return { job: j, res: res };
-      });
+      return awaitMsg(directWaiters, Math.max(8000, fireAt - Date.now() + 5000), null, byId(j.id))
+        .then(function (res) {
+          log("fire result for " + j.label + ": status " + ((res && res.status) || "timeout") +
+              ((res && res.error) ? " error=" + res.error : "") +
+              ((res && res.body) ? " body=" + String(res.body).slice(0, 200) : ""));
+          return { job: j, res: res };
+        });
     });
     if (armed.length) {
-      setStatus(armed.length > 1
-        ? "Полночь — " + armed.length + " прямых запроса ушли ⚡"
-        : "Полночь — прямой запрос ушёл ⚡");
+      toInject({ cmd: "arm-fire", ids: armed.map(function (j) { return j.id; }), at: fireAt });
     }
-    if (!isGrabbed()) {
+
+    // Fallback burst, deliberately AFTER the shots: selecting the target day
+    // makes the app fetch and render it, and extra replays feed the radar
+    // without waiting out its cadence — but both would steal the thread.
+    setTimeout(function () {
+      if (!live(myGen)) return;
+      if (armed.length) {
+        setStatus(armed.length > 1
+          ? "Полночь — " + armed.length + " прямых запроса ушли ⚡"
+          : "Полночь — прямой запрос ушёл ⚡");
+      }
+      if (isGrabbed()) return;
       var cell = dateCellButton(ymd(td));
       if (cell && !cell.disabled && cell.getAttribute("aria-disabled") !== "true") cell.click();
       toInject("replay");
       setTimeout(function () { if (live(myGen)) toInject("replay"); }, 150);
       setTimeout(function () { if (live(myGen)) toInject("replay"); }, 320);
-    }
+    }, Math.max(0, fireAt - Date.now()) + FIRE_BURST_DELAY_MS);
+
     if (!shots.length) return;
 
     var settled = await Promise.all(shots);
@@ -898,8 +933,14 @@
             turboOn = true;
             setStatus("Полночь близко — держу календарь горячим…");
           }
-          pokeApp(td);
-          await sleep(TURBO_POKE_MS);
+          // A poke runs Google's click handler and a grid re-render on the same
+          // thread the shot needs. Stand still right around the send.
+          if (inFireQuietWindow()) {
+            await sleep(40);
+          } else {
+            pokeApp(td);
+            await sleep(TURBO_POKE_MS);
+          }
         } else {
           if (turboOn) {
             turboOn = false;
@@ -924,23 +965,25 @@
       var t0 = Date.now();
       var rep = await replayOnce(2000);
       if (!live(myGen) || grabbed) return;
+      // Detection BEFORE logging: a log line costs a few µs of the thread and
+      // this is the path that decides the race.
+      if (tryDetect([rep && rep.body, lastAppSlots.body])) return;
       // Radar runs ~3x/s for hours, so per-request logging is a heartbeat
       // outside the rollover window and full detail inside it, where every
-      // response is worth seeing.
+      // response is worth seeing. Reaching here means tryDetect found no
+      // target, so the presence check needs no second scan.
       beat.n++;
       beat.lastStatus = (rep && rep.status) || 0;
       if (beat.lastStatus === 200) beat.ok++;
       if (inTurboWindow()) {
         log("radar replay: status " + beat.lastStatus + ", " + ((rep && rep.body) || "").length +
-            "b, target " + (bodiesContainTarget([rep && rep.body], td, jobs[0].timeMin) ? "PRESENT" : "absent") +
-            ", " + (Date.now() - t0) + "ms");
+            "b, target absent, " + (Date.now() - t0) + "ms");
       } else if (Date.now() - beat.since >= 10000) {
         log("radar heartbeat: " + beat.ok + "/" + beat.n + " ok in " +
             ((Date.now() - beat.since) / 1000).toFixed(0) + "s, midnight in " +
             (msUntilCourtMidnightCorrected() / 1000).toFixed(0) + "s");
         beat = { n: 0, ok: 0, since: Date.now(), lastStatus: beat.lastStatus };
       }
-      if (tryDetect([rep && rep.body, lastAppSlots.body])) return;
       if (rep && rep.status === 200) {
         fails = 0;
       } else if (++fails >= 6) {
@@ -1251,6 +1294,12 @@
     if (area !== "local" || !changes[STATE_KEY]) return;
     var s = changes[STATE_KEY].newValue;
     runGen++;                    // bump => any running poll/grab loop bails at once
+    log("state changed ->", s, "(runGen " + runGen + ")");
+    // inject owns the fire timer, so it cannot see runGen. Any state change
+    // invalidates a pending shot — without this, "Выключить" at 23:59:58 would
+    // still book at midnight. startPolling re-arms it when appropriate.
+    fireAtMs = 0;
+    toInject("cancel-fire");
     if (s === "armed") startPolling(runGen);
     else if (s === "grab") grabNow(runGen);
     // idle: nothing to start; the runGen bump already halted the loop.

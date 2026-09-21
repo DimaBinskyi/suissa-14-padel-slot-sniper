@@ -61,6 +61,41 @@
     post({ type: "booking-captured", ok: true });
   }
 
+  var FIRE_SPIN_MS = 6;   // busy-wait tail that absorbs timer lateness
+  // Bumped by every arm-fire and cancel-fire, so a pending timer that is no
+  // longer the current intent fires nothing.
+  var fireGen = 0;
+
+  // Send one prepared booking request. Nothing but the fetch() call happens
+  // before the request is handed to the network stack — logging comes after,
+  // because this runs at the single most latency-sensitive moment of the night.
+  function firePrepared(id) {
+    var req = prepared[id];
+    if (!req) {
+      log("fire[" + id + "] REFUSED: nothing prepared for this job");
+      post({ type: "direct-book-result", id: id, status: 0, body: "", error: "not-prepared" });
+      return;
+    }
+    delete prepared[id];      // single-use token; never fire the same one twice
+    var t0 = Date.now();
+    var p = fetch(req.url, {
+      method: req.method,
+      headers: req.headers,
+      body: req.body,
+      credentials: "include"
+    });
+    log("fire[" + id + "] POST " + req.body.length + "b issued");
+    p.then(function (r) {
+      return r.text().then(function (t) {
+        log("fire[" + id + "] <- " + r.status + " in " + (Date.now() - t0) + "ms: " + t.slice(0, 300));
+        post({ type: "direct-book-result", id: id, status: r.status, body: t.slice(0, 800) });
+      });
+    }).catch(function (err) {
+      log("fire[" + id + "] network error after " + (Date.now() - t0) + "ms: " + String(err));
+      post({ type: "direct-book-result", id: id, status: 0, body: "", error: String(err) });
+    });
+  }
+
   // Replace a number/date string only at non-digit boundaries, so an epoch is
   // never rewritten inside a longer number.
   function replaceNum(body, find, repl) {
@@ -232,31 +267,37 @@
       // Consumed: the next job must capture its own token rather than reuse it.
       bookingTemplate = null;
       post({ type: "direct-prepared", id: id, ok: okPrep, counts: counts });
+    } else if (d.cmd === "arm-fire") {
+      // MAIN and ISOLATED worlds share ONE thread, and postMessage delivery
+      // costs an event-loop turn — a "fire now" message would have to queue
+      // behind whatever the Calendar app happens to be rendering at midnight.
+      // So take the deadline ahead of time and fire from our own timer: then
+      // the only requirement at T+0 is that the thread is free.
+      var ids = (d.ids || []).slice();
+      var at = +d.at || 0;
+      if (!ids.length || !at) { log("arm-fire ignored (no ids or no deadline)"); return; }
+      var myFireGen = ++fireGen;
+      log("arm-fire: [" + ids.join(",") + "] in " + (at - Date.now()) + "ms");
+      setTimeout(function () {
+        // Disarmed (or re-armed) in the meantime — the content script owns that
+        // decision, and a shot nobody asked for would book against the user.
+        if (myFireGen !== fireGen) { log("fire[" + ids.join(",") + "] cancelled"); return; }
+        // Machine slept, or the tab was frozen straight through the rollover:
+        // the slot situation is no longer what the request was built for.
+        if (Date.now() > at + 5000) {
+          log("fire skipped: " + (Date.now() - at) + "ms late (tab throttled or machine asleep?)");
+          return;
+        }
+        // Busy-wait the last few ms: a timer can be late by more than that,
+        // and nothing may preempt us between here and the send.
+        while (Date.now() < at) { /* spin */ }
+        ids.forEach(function (id) { firePrepared(id); });
+      }, Math.max(0, at - Date.now() - FIRE_SPIN_MS));
+    } else if (d.cmd === "cancel-fire") {
+      if (fireGen) log("pending fire cancelled");
+      fireGen++;
     } else if (d.cmd === "direct-book") {
-      var bid = d.id || "a";
-      var req = prepared[bid];
-      if (!req) {
-        log("direct-book[" + bid + "] REFUSED: nothing prepared for this job");
-        post({ type: "direct-book-result", id: bid, status: 0, body: "", error: "not-prepared" });
-        return;
-      }
-      delete prepared[bid];     // single-use token; never fire the same one twice
-      var t0 = Date.now();
-      log("direct-book[" + bid + "] -> POST " + req.body.length + "b");
-      fetch(req.url, {
-        method: req.method,
-        headers: req.headers,
-        body: req.body,
-        credentials: "include"
-      }).then(function (r) {
-        return r.text().then(function (t) {
-          log("direct-book[" + bid + "] <- " + r.status + " in " + (Date.now() - t0) + "ms: " + t.slice(0, 300));
-          post({ type: "direct-book-result", id: bid, status: r.status, body: t.slice(0, 800) });
-        });
-      }).catch(function (err) {
-        log("direct-book[" + bid + "] network error after " + (Date.now() - t0) + "ms: " + String(err));
-        post({ type: "direct-book-result", id: bid, status: 0, body: "", error: String(err) });
-      });
+      firePrepared(d.id || "a");
     } else if (d.cmd === "ping") {
       post({ type: "pong", hasTemplate: !!template });
     }

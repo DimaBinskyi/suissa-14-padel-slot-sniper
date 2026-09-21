@@ -161,6 +161,40 @@ booking, and may need a small tweak the first time you run it live:
   `bframe` iframe. If a challenge slips through, capture its iframe `src`/DOM and
   adjust.
 
+## One thread (why the fire path looks the way it does)
+
+The page, `inject.js` (MAIN world) and `content.js` (ISOLATED world) all run on
+the renderer's **single main thread**. Network I/O does not: once `fetch()` is
+called the request is handed to the network stack and flies regardless of what
+JS does next. So the only thing that can cost us the race is delaying the
+*moment* `fetch()` is called — and UI work does exactly that, because a date
+click runs Google's own handlers and grid re-render synchronously.
+
+That drives four decisions:
+
+- **`inject.js` owns the fire timer.** `content.js` sends `arm-fire` with the
+  absolute deadline ~6 s ahead, and inject fires from its own timer.
+  A "fire now" `postMessage` costs an event-loop turn, so it could queue behind
+  whatever the app is rendering at midnight.
+- **A 6 ms busy-wait tail** absorbs timer lateness (measured: 2–3 ms of
+  scheduler jitter → 0 ms). Nothing may preempt us between the deadline and the
+  send.
+- **The fallback burst is deferred** to `fireAt + 60 ms`. Previously the date
+  click ran synchronously *before* inject's queued message was delivered, so
+  our own burst delayed our own request.
+- **The turbo poker stands still** within ±250 ms of the send, so we don't
+  hand the thread to a grid re-render at the worst possible moment.
+
+Remaining exposure: if the Calendar app is *already* mid-render when the
+deadline passes, we wait for it to finish — unavoidable with one thread. The
+blocking is asymmetric, though: the shot is ~1 ms of work and never meaningfully
+delays the UI path, and the UI grab only starts after detection (≥ one RTT after
+the rollover), by which time the shots are long gone.
+
+Safety: any state change sends `cancel-fire`, so disarming at 23:59:58 cannot
+leave a booking to go off at midnight, and a fire more than 5 s late (machine
+asleep, tab frozen) is skipped rather than sent against stale availability.
+
 ## Reading the logs
 
 Everything goes through `console.log`, tagged and timestamped to the
