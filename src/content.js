@@ -353,6 +353,16 @@
     return r.width > 0 && r.height > 0;
   }
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  // Polls until fn() is truthy and never settles otherwise — for use as one arm
+  // of a race whose timeout belongs to a different arm.
+  function untilTrue(fn, stepMs) {
+    return new Promise(function (res) {
+      (function tick() {
+        if (fn()) return res(true);
+        setTimeout(tick, stepMs || 250);
+      })();
+    });
+  }
   function waitFor(fn, timeoutMs, step) {
     var end = Date.now() + (timeoutMs || 6000);
     return new Promise(function (res) {
@@ -789,6 +799,13 @@
   var CAPTURE_ABORT_MS = 1800;
   // How far past the rollover a prepared shot is still worth firing.
   var FIRE_LATE_GRACE_MS = 60000;
+  // Waits around the page's own Book click. Measured live: the page can take
+  // 6-24s to mint its reCAPTCHA token and send, far longer than the ~1s a warm
+  // profile needs. Both windows are upper bounds — the normal case resolves in
+  // well under a second — and a window that expires early misreports a booking
+  // that actually succeeded.
+  var SEND_WAIT_MS = 12000;
+  var OUTCOME_WAIT_MS = 35000;
   var fireAtMs = 0;             // absolute local ms of the planned send
   function inFireQuietWindow() {
     if (!fireAtMs) return false;
@@ -1377,8 +1394,12 @@
     if (!book) return "nobutton";
 
     setStatus("Жму Book…");
-    var sentP = opts.handoff ? nextBookingSent(4000) : null;
-    var resultP = nextBookingResult(20000);
+    // These windows are generous on purpose. The page mints its reCAPTCHA token
+    // before sending, which is sub-second on a warm profile but was measured at
+    // 6-24s under heavy bot scrutiny — and a window that expires early turns a
+    // booking that DID succeed into a reported failure.
+    var sentP = opts.handoff ? nextBookingSent(SEND_WAIT_MS) : null;
+    var resultP = nextBookingResult(OUTCOME_WAIT_MS);
     var clickedAt = Date.now();
     book.click();
     log("Book clicked for " + job.label);
@@ -1390,31 +1411,37 @@
     // send is observed we fall through to the full wait, so this can never be
     // slower than not having it.
     if (sentP) {
+      // The captcha arm must only settle when a challenge is actually visible.
+      // Giving it its own timeout made it resolve null first and win the race,
+      // capping the send wait at the captcha timeout regardless of
+      // SEND_WAIT_MS — observed live, aborting a handoff that would have worked.
       var s = await Promise.race([
-        sentP.then(function (d) { return d ? { sent: d } : null; }),
-        waitFor(captchaVisible, 4000, 250).then(function (v) { return v ? { captcha: true } : null; })
+        sentP.then(function (d) { return d ? { sent: d } : { none: true }; }),
+        untilTrue(captchaVisible, 250).then(function () { return { captcha: true }; })
       ]);
       if (!live(myGen)) return "aborted";
       if (s && s.captcha) return "captcha";
       if (s && s.sent) {
         log("handoff: " + job.label + " is in flight after " + (Date.now() - clickedAt) +
             "ms (seq " + s.sent.seq + ") — queue moves on");
-        opts.handoff(job, bookingResultFor(s.sent.seq, 20000));
+        opts.handoff(job, bookingResultFor(s.sent.seq, OUTCOME_WAIT_MS));
         return "sent";
       }
-      log("handoff: no send seen for " + job.label + " within 4s — waiting for the outcome as usual");
+      log("handoff: no send seen for " + job.label + " within " + SEND_WAIT_MS +
+          "ms — waiting for the outcome as usual");
     }
 
     var outcome = await Promise.race([
       resultP.then(function (r) { return { kind: "rpc", data: r }; }),
-      waitFor(captchaVisible, 20000, 300).then(function (v) { return v ? { kind: "captcha" } : null; }),
-      waitFor(bookingConfirmed, 20000, 400).then(function (v) { return v ? { kind: "confirmed" } : null; }),
-      waitFor(slotTakenText, 20000, 250).then(function (v) { return v ? { kind: "taken" } : null; })
+      waitFor(captchaVisible, OUTCOME_WAIT_MS, 300).then(function (v) { return v ? { kind: "captcha" } : null; }),
+      waitFor(bookingConfirmed, OUTCOME_WAIT_MS, 400).then(function (v) { return v ? { kind: "confirmed" } : null; }),
+      waitFor(slotTakenText, OUTCOME_WAIT_MS, 250).then(function (v) { return v ? { kind: "taken" } : null; })
     ]);
     if (!outcome || (outcome.kind === "rpc" && outcome.data && outcome.data.status !== 200)) {
       if (captchaVisible()) outcome = { kind: "captcha" };
     }
 
+    var raceMs = Date.now() - clickedAt;
     log("Book outcome for " + job.label + ": " + ((outcome && outcome.kind) || "nothing") +
         (outcome && outcome.kind === "rpc" ? " http=" + ((outcome.data && outcome.data.status) || 0) +
           ((outcome.data && outcome.data.body) ? " body=" + String(outcome.data.body).slice(0, 200) : "") : "") +
@@ -1423,7 +1450,19 @@
     if (outcome && outcome.kind === "taken") return "taken";
     var ok = (outcome && outcome.kind === "confirmed") ||
              (outcome && outcome.kind === "rpc" && outcome.data && outcome.data.status === 200);
-    return ok ? "ok" : "unconfirmed";
+    if (ok) return "ok";
+    // No verdict in time. Before calling it a failure, ask the server whether
+    // the slot is still bookable — in testing the page sent its request after
+    // our window closed, so a real booking was reported as a failure and its
+    // summary said "0 of 2". A slot that has gone away right after we pressed
+    // Book is most likely ours, but say "probably" rather than claim it.
+    var chk = await replayOnce(3000);
+    if (!live(myGen)) return "aborted";
+    if (chk && chk.body && !bodiesContainTarget([chk.body], td, timeMin)) {
+      log("no verdict in " + raceMs + "ms, but " + job.label + " is no longer bookable — treating as probably booked");
+      return "probably";
+    }
+    return "unconfirmed";
   }
 
   // After a booking completes, the page can sit on a confirmation view. Get
@@ -1471,6 +1510,9 @@
       notify("Padel: проверь вкладку", "Кнопка Book не найдена для " + job.time + ".", true);
     } else if (out === "unrendered") {
       setStatus("Слот " + job.label + " не отрисовался вовремя", "warn");
+    } else if (out === "probably") {
+      setStatus("Похоже, " + job.label + " забронирован — проверь почту", "warn");
+      notify("Padel: похоже, забронировано", "Слот " + when + " больше не свободен, но подтверждение не пришло. Проверь почту.", true);
     } else if (out === "unconfirmed") {
       if (job.directWon) {
         setStatus("✅ Слот " + job.label + " уже забронирован прямым запросом", "ok");
@@ -1532,20 +1574,22 @@
       if (job.directWon) { log("skip " + job.label + " — already won by the direct shot"); job.done = true; job.ok = true; continue; }
       // Only return to the grid when the previous job actually finished. After
       // a handoff its dialog is deliberately left open and ours stacks on top.
+      var stacked = prevHandedOff;
       if (did > 0 && !prevHandedOff && !(await backToGrid(myGen))) {
         if (!live(myGen)) return;
-        log("could not get back to the slot grid before " + job.label);
-        job.done = true;
-        setStatus("Не удалось вернуться к сетке — забронируй " + job.label + " вручную", "error");
-        notify("Padel: добей вручную", "Слот " + job.time + " не забронирован — открой вкладку.", true);
-        continue;
+        // A dialog we could not dismiss is NOT a reason to abandon this slot:
+        // its Cancel is simply disabled while the previous booking submits, and
+        // clicking our slot stacks a fresh dialog on top of it regardless.
+        // Giving up here lost a bookable slot in testing.
+        log("could not dismiss the previous dialog before " + job.label + " — stacking on top of it instead");
+        stacked = true;
       }
       // Hand off every job except the last: there is nothing left to overlap
       // with after it, so the last one waits and reports normally.
       var isLast = (i === queue.length - 1);
       var out = await grabJob(td, job, cfg, myGen, {
         handoff: isLast ? null : handoff,
-        expectStacked: prevHandedOff
+        expectStacked: stacked
       });
       if (!live(myGen) || out === "aborted") return;
       did++;
@@ -1553,7 +1597,7 @@
       if (out === "sent") { job.done = true; continue; }   // reported by its handoff
       job.done = true;
       job.out = out;
-      job.ok = (out === "ok");
+      job.ok = (out === "ok" || out === "probably");
       reportJob(job, out, cfg);
       // A captcha challenge or a half-filled form blocks everything behind it.
       if (out === "captcha" || out === "manual" || out === "noform" || out === "nobutton") {
