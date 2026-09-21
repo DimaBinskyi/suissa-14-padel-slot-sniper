@@ -191,6 +191,22 @@ blocking is asymmetric, though: the shot is ~1 ms of work and never meaningfully
 delays the UI path, and the UI grab only starts after detection (≥ one RTT after
 the rollover), by which time the shots are long gone.
 
+Two invariants worth knowing, because both were bugs once:
+
+- **Time to the rollover is signed** (`msToRollover()`). The underlying
+  "ms until midnight" counts to the *next* midnight, so it jumps from ~0 to
+  ~86,400,000 the instant the rollover passes. Every gate meaning "is it near /
+  has it passed" uses the signed form; reading the raw value there inverted the
+  test at exactly the wrong moment and silently discarded the prepared shot.
+- **A win needs positive evidence.** The verification replay must come back
+  with a body that no longer contains the slot. An empty body means the
+  verification failed, not that we got it — otherwise a booking that never
+  happened is reported as done and the UI path skips its only retry.
+
+Only one tab runs the engine: each claims ownership in `chrome.storage`
+(`owner`, heartbeat every 3 s), and the others go passive rather than firing a
+duplicate shot per job.
+
 Safety, biased towards *getting the booking*: any state change sends
 `cancel-fire`, so disarming at 23:59:58 cannot leave a booking to go off at
 midnight. But a **late** fire is still sent — a stale token merely gets

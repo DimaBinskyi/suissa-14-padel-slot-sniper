@@ -42,10 +42,9 @@
   }
   function tOffset() {
     if (!clockOffsets.length) return "";
-    var left = msUntilCourtMidnightCorrected();
-    if (left > 86400000 - 120000) return " T+" + ((86400000 - left) / 1000).toFixed(3) + "s";
-    if (left < 120000) return " T-" + (left / 1000).toFixed(3) + "s";
-    return "";
+    var d = msToRollover();
+    if (d > 120000 || d < -120000) return "";
+    return d >= 0 ? " T-" + (d / 1000).toFixed(3) + "s" : " T+" + (-d / 1000).toFixed(3) + "s";
   }
   var log = function () {
     var a = ["[padel " + stamp() + tOffset() + "]"].concat([].slice.call(arguments));
@@ -94,6 +93,13 @@
         lastAppSlots = { body: d.body || "", ts: Date.now() };
       }
       if (onSlotsBody) onSlotsBody(d.body || "");
+    } else if (d.type === "clock-sample") {
+      if (d.dateHeader) noteClockSample(d.dateHeader, d.tSent, d.tRecv);
+      else if (!clockProbeWarned) {
+        clockProbeWarned = true;
+        log("clock probe returned no Date header (" + (d.error || "status " + d.status) +
+            ") — scheduling on the LOCAL clock");
+      }
     } else if (d.type === "booking-result") {
       flushWaiters(bookingWaiters, d);
     } else if (d.type === "booking-captured") {
@@ -126,19 +132,35 @@
   }
   function byId(id) { return function (d) { return d && d.id === id; }; }
 
+  // Each replay carries its own id, so a reply can only resolve the call that
+  // asked for it. Without this, the radar and the midnight verification share
+  // a waiter list and the first response to land answers both — which let a
+  // pre-shot body be read as the post-shot state of the world.
+  var replaySeq = 0;
   function replayOnce(timeoutMs) {
+    var rid = ++replaySeq;
     return new Promise(function (res) {
       var done = false;
       var t = setTimeout(function () { if (!done) { done = true; res({ body: "", status: 0, timeout: true }); } }, timeoutMs || 5000);
-      slotWaiters.push({ fn: function (d) { if (!done) { done = true; clearTimeout(t); res(d); } } });
-      toInject("replay");
+      slotWaiters.push({
+        pred: function (d) { return d && d.rid === rid; },
+        fn: function (d) { if (!done) { done = true; clearTimeout(t); res(d); } }
+      });
+      toInject({ cmd: "replay", rid: rid });
     });
   }
+  // Only accept a booking result for a request the page sent AFTER we started
+  // waiting. One job's late response would otherwise resolve the next job's
+  // wait and report a booking that never happened.
   function nextBookingResult(timeoutMs) {
+    var since = Date.now();
     return new Promise(function (res) {
       var done = false;
       var t = setTimeout(function () { if (!done) { done = true; res(null); } }, timeoutMs || 20000);
-      bookingWaiters.push({ fn: function (d) { if (!done) { done = true; clearTimeout(t); res(d); } } });
+      bookingWaiters.push({
+        pred: function (d) { return !d || d.sentAt == null || d.sentAt >= since; },
+        fn: function (d) { if (!done) { done = true; clearTimeout(t); res(d); } }
+      });
     });
   }
 
@@ -211,9 +233,12 @@
   // The booking window rolls over at midnight in the COURT's timezone, and that
   // is when the new day's slots appear. Knowing how far off that is lets us keep
   // the calendar hot right before it — see the turbo window in startPolling().
-  function msUntilCourtMidnight() {
+  // `now` is passed in so the caller's sub-second correction is taken from the
+  // same instant; reading the clock twice can straddle a second boundary and
+  // put the result a full second out.
+  function msUntilCourtMidnight(now) {
     var p = {};
-    FMT_CLOCK.formatToParts(new Date()).forEach(function (x) { p[x.type] = x.value; });
+    FMT_CLOCK.formatToParts(new Date(now || Date.now())).forEach(function (x) { p[x.type] = x.value; });
     var secs = ((+p.hour) % 24) * 3600 + (+p.minute) * 60 + (+p.second);
     return (86400 - secs) * 1000;
   }
@@ -225,6 +250,7 @@
   // SCHEDULE the midnight shot instead of discovering the rollover by polling.
   var clockOffsets = [];
   var lastLoggedOffset = null;
+  var clockProbeWarned = false;
   function noteClockSample(dateHeader, tSent, tRecv) {
     var s = Date.parse(dateHeader || "");
     if (!s || !tSent || !tRecv) return;
@@ -238,7 +264,7 @@
       lastLoggedOffset = off;
       log("clock sync: server offset " + (off >= 0 ? "+" : "") + Math.round(off) + "ms" +
           " (rtt " + rtt + "ms, " + clockOffsets.length + " samples), midnight in " +
-          (msUntilCourtMidnightCorrected() / 1000).toFixed(1) + "s");
+          (msToRollover() / 1000).toFixed(1) + "s");
     }
   }
   function clockOffset() {
@@ -250,7 +276,25 @@
   // back (tz offsets are whole minutes, so second boundaries coincide) and
   // shift by the server offset.
   function msUntilCourtMidnightCorrected() {
-    return msUntilCourtMidnight() - (Date.now() % 1000) - clockOffset();
+    var now = Date.now();
+    return msUntilCourtMidnight(now) - (now % 1000) - clockOffset();
+  }
+  // SIGNED distance to the rollover: negative once it has passed.
+  //
+  // msUntilCourtMidnightCorrected() counts to the NEXT midnight, so it jumps
+  // from ~0 to ~86,400,000 the instant the rollover happens. Every gate that
+  // means "is the rollover near / has it passed" must use this form — reading
+  // the unsigned value there inverts the test at exactly the wrong moment.
+  function msToRollover() {
+    var left = msUntilCourtMidnightCorrected();
+    return left > 43200000 ? left - 86400000 : left;
+  }
+  // Which rollover opens the target: before midnight the next one reveals
+  // today+2; just after, the day that opened is today+1 because the court date
+  // has already advanced. Deriving this from courtYmdPlus(2) alone made the
+  // whole direct-shot path switch itself off the moment midnight passed.
+  function targetOpensAtThisRollover(td) {
+    return ymd(td) === courtYmdPlus(msToRollover() > 0 ? 2 : 1);
   }
   // Court-timezone date `days` ahead as "YYYYMMDD". The upcoming midnight
   // rollover opens courtYmdPlus(2): entering day X+1 reveals day X+2.
@@ -385,9 +429,14 @@
     var d = dialogEl();
     if (!d) return false;
     var t = (d.textContent || "").toLowerCase().replace(/\s+/g, "");
-    var endMin = timeMin + 90;
-    if (t.indexOf(hhmm12(endMin) + meridiem(endMin)) !== -1) return false;
-    return /\d{1,2}:\d{2}(am|pm)/.test(t);
+    // Parse the header's range rather than hunting for one needle. Matching the
+    // END time alone accepted the wrong modal whenever a slot's end equalled
+    // another slot's start: a 10:00 job (ending 11:30am) accepted the 11:30
+    // slot's "11:30am–1:00pm" header and would have booked it.
+    var m = t.match(/(\d{1,2}:\d{2})(am|pm)?[–—-](\d{1,2}:\d{2})(am|pm)/);
+    if (!m) return /\d{1,2}:\d{2}(am|pm)/.test(t);   // unrecognised: don't block
+    var startMer = m[2] || m[4];   // omitted start meridiem means it matches the end
+    return !(m[1] === hhmm12(timeMin) && startMer === meridiem(timeMin));
   }
   // "Wednesday, July 8, 4:00 – 5:30pm" -> {y,m,d}. The header has no year, but
   // bookable dates are never more than a couple of days out, so pick the year
@@ -576,8 +625,9 @@
     if (!all.length) return;
     all[0].click();
     var f = await waitFor(formIsOpen, 4000, 60);
-    if (!live(myGen) || !alive()) return;
     if (f) log("booking modal prewarmed");
+    // Close it even when the run was invalidated mid-warm: bailing out early
+    // used to leave a foreign booking modal open for the grab to trip over.
     await closeModal();
   }
 
@@ -610,6 +660,36 @@
   }
   function jobTimes(jobs) {
     return jobs.map(function (j) { return j.label; }).join(" + ");
+  }
+
+  // ---------- single owner ----------
+  // Every calendar tab runs this script and every one reacts to the same
+  // storage state, so two open tabs meant two radars, two captures and two
+  // direct shots per job fired at the same millisecond — systematic duplicate
+  // bookings, plus one tab disarming while the other was mid-grab. One tab
+  // claims the run; the others stay passive and say so.
+  var TAB_ID = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  var OWNER_KEY = "owner";
+  var OWNER_STALE_MS = 8000;
+  var OWNER_BEAT_MS = 3000;
+  var lastBeat = 0;
+
+  async function claimOwnership() {
+    var cur = (await get([OWNER_KEY]))[OWNER_KEY];
+    var fresh = cur && cur.id && (Date.now() - (cur.ts || 0) < OWNER_STALE_MS);
+    if (fresh && cur.id !== TAB_ID) return false;
+    await set({ owner: { id: TAB_ID, ts: Date.now() } });
+    // Re-read: two tabs can pass the check together, and the last write wins.
+    await sleep(60 + Math.floor(Math.random() * 120));
+    var after = (await get([OWNER_KEY]))[OWNER_KEY];
+    if (!after || after.id !== TAB_ID) return false;
+    lastBeat = Date.now();
+    return true;
+  }
+  function beatOwnership() {
+    if (Date.now() - lastBeat < OWNER_BEAT_MS) return;
+    lastBeat = Date.now();
+    set({ owner: { id: TAB_ID, ts: Date.now() } });
   }
 
   // ---------- run control ----------
@@ -653,6 +733,8 @@
   // (closing its modal) if it would otherwise still be open at the rollover.
   var DIRECT_PREP_MIN_MS = 7000;
   var CAPTURE_ABORT_MS = 1800;
+  // How far past the rollover a prepared shot is still worth firing.
+  var FIRE_LATE_GRACE_MS = 60000;
   var fireAtMs = 0;             // absolute local ms of the planned send
   function inFireQuietWindow() {
     if (!fireAtMs) return false;
@@ -661,8 +743,8 @@
   }
   var DIRECT_SEND_DELAY_MS = 120;
   function inTurboWindow() {
-    var left = msUntilCourtMidnightCorrected();
-    return left <= TURBO_LEAD_MS || left >= 86400000 - TURBO_TAIL_MS;
+    var d = msToRollover();
+    return d <= TURBO_LEAD_MS && d >= -TURBO_TAIL_MS;
   }
 
   // ---------- direct shot ----------
@@ -677,6 +759,20 @@
   // other. If both land, the worst case is a duplicate booking to cancel by
   // hand — losing the slot costs more than an extra cancellation.
   //
+  // Set while a capture has a Book click in flight on a SACRIFICIAL slot. Until
+  // it settles, the swallow in inject.js is the only thing stopping that slot
+  // from being booked for real, so a manual "book now" waits it out rather than
+  // disarming underneath it.
+  var capturePending = null;
+  function settleCapture() {
+    if (capturePending) { capturePending.done(); capturePending = null; }
+  }
+  function markCapturePending() {
+    var resolve;
+    var p = new Promise(function (r) { resolve = r; });
+    capturePending = { promise: p, done: resolve };
+  }
+
   async function prepareDirectBooking(td, job, cfg, myGen, isGrabbed) {
     try {
       setStatus("Готовлю прямой запрос для " + job.label + "…");
@@ -703,7 +799,7 @@
       // Point of no return: past here we arm the swallow and wait on the page.
       // If the rollover is about to land, abandon the capture now so the grid
       // is clean for the UI path instead of holding a modal open through it.
-      if (msUntilCourtMidnightCorrected() < CAPTURE_ABORT_MS) {
+      if (msToRollover() < CAPTURE_ABORT_MS) {
         log("direct prep: aborting, rollover too close to finish the capture");
         await closeModal();
         return false;
@@ -718,6 +814,7 @@
       var book = bookButton();
       if (!book) { log("direct prep: no Book button"); await closeModal(); return false; }
       var capP = awaitMsg(captureWaiters, 6000);
+      markCapturePending();
       book.click();
       var cap = await capP;
       if ((!cap || !cap.ok) && captchaVisible()) {
@@ -725,7 +822,7 @@
         // night: solving it makes the page finish building the request, which
         // we capture as usual. Keep the swallow alive while they solve — but
         // only for the time actually left before the fire moment.
-        var solveMs = Math.min(45000, msUntilCourtMidnightCorrected() - 8000);
+        var solveMs = Math.min(45000, msToRollover() - 8000);
         if (solveMs > 3000) {
           toInject({ cmd: "suppress-extend", ttl: solveMs + 10000 });
           setStatus("Капча на прогреве! Реши её — токен нужен до полуночи", "error");
@@ -753,8 +850,12 @@
       log("direct prep error", e);
       return false;
     } finally {
+      settleCapture();
       // NEVER leave the hook swallowing bookings — it would eat a real Book
-      // click later. (The modal is already closed on every path above.)
+      // click later. The catch path can reach here with the modal still open
+      // (setStatus/notify throw synchronously on "extension context
+      // invalidated"), so close it here rather than trusting every path above.
+      try { if (dialogEl()) await closeModal(); } catch (e2) { /* nothing left to do */ }
       toInject("suppress-booking-off");
     }
   }
@@ -766,7 +867,7 @@
     for (var i = 0; i < jobs.length; i++) {
       var job = jobs[i];
       if (job.prepared) continue;
-      if (msUntilCourtMidnightCorrected() < DIRECT_PREP_MIN_MS) {
+      if (msToRollover() < DIRECT_PREP_MIN_MS) {
         log("direct prep: not enough time left for " + job.label);
         break;
       }
@@ -786,7 +887,9 @@
   //      fallback burst is deferred past the fire moment, and the turbo poker
   //      holds still in a quiet window around it.
   async function scheduleMidnightFire(td, jobs, cfg, myGen, isGrabbed) {
-    var fireAt = Date.now() + msUntilCourtMidnightCorrected() + DIRECT_SEND_DELAY_MS;
+    // Math.max(0, …): if the rollover already passed, fire now rather than
+    // computing a deadline 24h away.
+    var fireAt = Date.now() + Math.max(0, msToRollover()) + DIRECT_SEND_DELAY_MS;
     fireAtMs = fireAt;
     var armed = jobs.filter(function (j) { return j.prepared; });
     log("midnight fire scheduled in " + (fireAt - Date.now()) + "ms " +
@@ -838,33 +941,50 @@
     });
     // A 200 can still hide an in-body error, so believe it only once
     // availability shows the slot gone. One replay verifies every job.
+    // A win needs POSITIVE evidence that the slot is gone. An empty body means
+    // the verification itself failed (timeout, network error) — "no data" must
+    // never be read as "we got it", or a booking that never happened is
+    // reported as done and the UI path skips its only retry. One retry first,
+    // since this runs in the congested second after the rollover.
     var chk = await replayOnce(1600);
     if (!live(myGen)) return;
+    if (!(chk && chk.body)) {
+      log("verification replay came back empty — retrying once");
+      chk = await replayOnce(2500);
+      if (!live(myGen)) return;
+    }
     var body = (chk && chk.body) || "";
-    var wonJobs = [], lostJobs = [];
+    var verified = !!body;
+    if (!verified) log("verification UNAVAILABLE — not claiming any win; the UI path decides");
+    var wonJobs = [], stolenJobs = [], unknownJobs = [];
     settled.forEach(function (s) {
-      var gone = !(body && bodiesContainTarget([body], td, s.job.timeMin));
-      log("verify " + s.job.label + ": http=" + ((s.res && s.res.status) || 0) +
-          " slotStillOpen=" + (!gone) + " -> " + (s.res && s.res.status === 200 && gone ? "WON" : "not won"));
-      if (s.res && s.res.status === 200 && gone) { s.job.directWon = true; wonJobs.push(s.job); }
-      else lostJobs.push(s.job);
+      var http = (s.res && s.res.status) || 0;
+      var stillOpen = verified && bodiesContainTarget([body], td, s.job.timeMin);
+      var gone = verified && !stillOpen;
+      log("verify " + s.job.label + ": http=" + http + " verified=" + verified +
+          " slotStillOpen=" + stillOpen + " -> " +
+          (http === 200 && gone ? "WON" : (!verified ? "UNKNOWN" : "not won")));
+      if (http === 200 && gone) { s.job.directWon = true; wonJobs.push(s.job); }
+      else if (gone) stolenJobs.push(s.job);   // slot gone but our shot failed
+      else if (!verified) unknownJobs.push(s.job);
     });
     if (wonJobs.length) {
-      var names = wonJobs.map(function (j) { return j.label; }).join(" + ");
+      var names = jobTimes(wonJobs);
       setStatus("✅ " + names + " забронирован прямым запросом!", "ok");
       notify("✅ Padel забронирован", "Слот " + cfg.targetDate + " " + names + " занят прямым запросом. Проверь почту.", true);
     }
-    // Nothing of ours got through and the slots are gone too -> a rival won.
-    if (!wonJobs.length && lostJobs.length && body && !isGrabbed()) {
-      var stolen = lostJobs.filter(function (j) { return !bodiesContainTarget([body], td, j.timeMin); });
-      if (stolen.length) {
-        setStatus("Слот перехватили раньше нас", "error");
-        notify("Padel: слот перехвачен", "Кто-то забронировал " +
-          stolen.map(function (j) { return j.time; }).join(", ") + " первым.", true);
-      }
+    // Report every slot that is gone without us getting it, even when another
+    // job of the same run succeeded.
+    if (stolenJobs.length && !isGrabbed()) {
+      setStatus("Слот " + jobTimes(stolenJobs) + " перехватили раньше нас", "error");
+      notify("Padel: слот перехвачен", "Кто-то забронировал " +
+        stolenJobs.map(function (j) { return j.time; }).join(", ") + " первым.", true);
     }
-    // Don't disarm while a UI grab is still working — it reports its own result.
-    if (!isGrabbed() && wonJobs.length === jobs.length) await setState("idle");
+    // Disarm only when every job is settled one way or the other and no UI grab
+    // is working. Previously this required ALL jobs to be won, so a mixed
+    // outcome left the radar running for a slot that could never reappear.
+    var settledCount = wonJobs.length + stolenJobs.length;
+    if (!isGrabbed() && !unknownJobs.length && settledCount === jobs.length) await setState("idle");
   }
 
   async function startPolling(myGen) {
@@ -874,6 +994,22 @@
     var td = parseTargetDate(cfg.targetDate);
     var jobs = buildJobs(cfg);
     if (!td || !jobs.length) { setStatus("Заполни дату и время в popup", "error"); return; }
+    // Adding a profile blanks the identity fields, and the popup autosaves
+    // that without touching `state` — so an armed run could reach Book with an
+    // empty form (fillForm reports success for empty strings). Refuse instead.
+    var blank = jobs.filter(function (j) { return !j.data.email || !j.data.firstName; });
+    if (blank.length) {
+      setStatus("Нет имени/email для " + jobTimes(blank) + " — заполни профиль", "error");
+      log("refusing to run: blank identity for", jobTimes(blank));
+      return;
+    }
+
+    if (!(await claimOwnership())) {
+      log("another calendar tab owns this run — staying passive");
+      setStatus("Бронирует другая вкладка календаря (эта в резерве)", "warn");
+      return;
+    }
+    if (!live(myGen)) return;
 
     setStatus("Жду открытия " + jobTimes(jobs) + " на " + cfg.targetDate + " (радар " + REPLAY_MS + "мс)…");
 
@@ -891,8 +1027,12 @@
       if (!hit.length) return false;
       grabbed = true;
       onSlotsBody = null;
+      // This body has now been acted on. Leaving it in place would make the
+      // next armed run (after a re-arm) detect instantly from the same stale
+      // evidence and spin grab -> re-arm -> grab.
+      lastAppSlots = { body: "", ts: 0 };
       log("slot detected in ListAvailableSlots response:", jobTimes(hit));
-      runGrabs(td, jobs, cfg, myGen);
+      runGrabs(td, jobs, cfg, myGen, hit);
       return true;
     }
     // Event-driven path: every availability response (the app's own or a
@@ -912,16 +1052,25 @@
       var turboOn = false;
       var directCtl = { attempts: 0, scheduled: false };
       var prepLead = directPrepLeadMs(jobs.length);
+      var nextProbe = 0;
       while (live(myGen) && !grabbed) {
         // Any dialog left open (prewarm, a stray click) would swallow the
         // clicks below and the slot click when the moment comes.
         if (dialogEl()) { await closeModal(); if (!live(myGen) || grabbed) return; }
         await ensureMonth(td); if (!live(myGen) || grabbed) return;
+        beatOwnership();   // let a second tab see this run is alive
+        // Keep the server-clock estimate fresh; tighter as the rollover nears,
+        // since that estimate is what the whole shot is scheduled against.
+        if (Date.now() >= nextProbe) {
+          var near = Math.abs(msToRollover()) < 120000;
+          nextProbe = Date.now() + (near ? 5000 : 60000);
+          toInject("clock-probe");
+        }
         // Direct shot: only on the night whose rollover actually opens the
         // target date — firing it a night early would just spend the token —
         // and only with auto-Book on: the shot IS an automatic booking.
-        var leftMs = msUntilCourtMidnightCorrected();
-        var opensTonight = !!cfg.autoBook && ymd(td) === courtYmdPlus(2);
+        var leftMs = msToRollover();
+        var opensTonight = !!cfg.autoBook && targetOpensAtThisRollover(td);
         var pending = jobs.some(function (j) { return !j.prepared; });
         if (opensTonight && pending && directCtl.attempts < 2 &&
             leftMs <= prepLead && leftMs > DIRECT_PREP_MIN_MS) {
@@ -935,8 +1084,12 @@
           parkedYmd = 0;                    // the sacrificial modal click moved focus
           continue;
         }
-        if (opensTonight && !directCtl.scheduled && leftMs <= 6000) {
+        // Schedule from 6s out, and still schedule if a slow capture pushed us
+        // just past the rollover — the slot is open NOW, so firing immediately
+        // is exactly right. Only the token's own lifetime limits how late.
+        if (opensTonight && !directCtl.scheduled && leftMs <= 6000 && leftMs > -FIRE_LATE_GRACE_MS) {
           directCtl.scheduled = true;
+          if (leftMs < 0) log("rollover already passed by " + (-leftMs) + "ms — firing as soon as possible");
           scheduleMidnightFire(td, jobs, cfg, myGen, function () { return grabbed; });
         }
         if (inTurboWindow()) {
@@ -994,7 +1147,7 @@
       } else if (Date.now() - beat.since >= 10000) {
         log("radar heartbeat: " + beat.ok + "/" + beat.n + " ok in " +
             ((Date.now() - beat.since) / 1000).toFixed(0) + "s, midnight in " +
-            (msUntilCourtMidnightCorrected() / 1000).toFixed(0) + "s");
+            (msToRollover() / 1000).toFixed(0) + "s");
         beat = { n: 0, ok: 0, since: Date.now(), lastStatus: beat.lastStatus };
       }
       if (rep && rep.status === 200) {
@@ -1190,12 +1343,18 @@
   // After a booking completes, the page can sit on a confirmation view. Get
   // back to the slot grid so the next job has something to click.
   async function backToGrid(myGen) {
-    if (slotButtonsAll().length) return true;
+    // Grid buttons behind a modal overlay still pass visible(), so the button
+    // count alone is not proof we are back on the grid — a leftover dialog
+    // would swallow the next job's clicks (or worse, be filled in as if it
+    // were that job's own modal).
+    if (!dialogEl() && slotButtonsAll().length) return true;
     await closeModal();
     if (!live(myGen)) return false;
-    if (slotButtonsAll().length) return true;
+    if (!dialogEl() && slotButtonsAll().length) return true;
     clickByText(["Done", "Close", "Book another time", "Listo", "Cerrar", "Готово", "Закрыть"]);
-    var seen = await waitFor(function () { return slotButtonsAll().length ? true : null; }, 3000, 80);
+    var seen = await waitFor(function () {
+      return (!dialogEl() && slotButtonsAll().length) ? true : null;
+    }, 3000, 80);
     return !!seen;
   }
 
@@ -1238,11 +1397,34 @@
 
   // Work the jobs one at a time — there is a single modal in the DOM, so UI
   // bookings cannot overlap. Jobs already won by a direct shot are skipped.
-  async function runGrabs(td, jobs, cfg, myGen) {
+  async function runGrabs(td, jobs, cfg, myGen, detected) {
+    try {
+      await runGrabsInner(td, jobs, cfg, myGen, detected);
+    } catch (e) {
+      // Without this, a throw anywhere in the grab pipeline leaves the state
+      // "armed"/"grab" with no loop running: armed, blind and silent.
+      log("GRAB PIPELINE THREW:", e && e.message ? e.message : String(e), e && e.stack ? e.stack : "");
+      setStatus("Ошибка при бронировании — проверь вкладку", "error");
+      notify("Padel: ошибка", "Бронирование прервано ошибкой. Открой вкладку календаря.", true);
+      try { await setState("idle"); } catch (e2) { /* context gone */ }
+    }
+  }
+
+  async function runGrabsInner(td, jobs, cfg, myGen, detected) {
     var did = 0;
-    log("UI booking queue starts: " + jobTimes(jobs) + " on " + cfg.targetDate);
-    for (var i = 0; i < jobs.length; i++) {
-      var job = jobs[i];
+    // Work the slots we KNOW are open first. With two jobs, fixed config order
+    // could park us on an unavailable slot for its full 15s deadline — while
+    // thrashing the grid with refetches — before touching the one that just
+    // opened.
+    var queue = jobs.slice().sort(function (a, b) {
+      var ad = detected && detected.indexOf(a) !== -1 ? 0 : 1;
+      var bd = detected && detected.indexOf(b) !== -1 ? 0 : 1;
+      return ad - bd;
+    });
+    log("UI booking queue starts: " + jobTimes(queue) + " on " + cfg.targetDate +
+        (detected && detected.length ? " (detected: " + jobTimes(detected) + ")" : ""));
+    for (var i = 0; i < queue.length; i++) {
+      var job = queue[i];
       if (!live(myGen)) return;
       if (job.done) continue;
       if (job.directWon) { log("skip " + job.label + " — already won by the direct shot"); job.done = true; job.ok = true; continue; }
@@ -1272,27 +1454,41 @@
     if (jobs.length > 1) {
       setStatus(okJobs.length === jobs.length
         ? "✅ Забронировано: " + jobTimes(okJobs)
-        : "Забронировано " + okJobs.length + " из " + jobs.length + " (" + jobTimes(okJobs) + ")",
+        : "Забронировано " + okJobs.length + " из " + jobs.length + " (" + (jobTimes(okJobs) || "—") + ")",
         okJobs.length === jobs.length ? "ok" : "warn");
     }
-    // Nothing booked and the only thing that went wrong was a slot failing to
-    // render: detection may have been early, so keep waiting rather than
-    // disarming. Any conclusive outcome (taken, captcha, form trouble) must NOT
-    // re-arm, or we'd wait forever for a slot a rival already holds. Never
-    // re-arm after a success either — rebuilt jobs lose their state and would
-    // book the same slot twice.
-    var conclusive = jobs.some(function (j) { return j.out && j.out !== "unrendered"; });
+    // Re-arm when nothing was booked and at least one slot merely failed to
+    // render — that slot may still open, so keep waiting. This is decided
+    // PER JOB: previously one job's conclusive loss ("taken") cancelled the
+    // re-arm the other job still needed, abandoning an open slot.
+    // Never re-arm after any success: jobs are rebuilt from cfg on re-entry,
+    // which would lose their state and book the same slot twice.
     var anyUnrendered = jobs.some(function (j) { return j.out === "unrendered"; });
-    if (!okJobs.length && anyUnrendered && !conclusive &&
-        (await get([STATE_KEY]))[STATE_KEY] === "armed" && live(myGen)) {
+    if (!okJobs.length && anyUnrendered && live(myGen) &&
+        (await get([STATE_KEY]))[STATE_KEY] === "armed") {
       setStatus("Слот не отрисовался вовремя — продолжаю ждать", "warn");
       startPolling(myGen);
       return;
+    }
+    // Disarming with something still unbooked is worth saying out loud — the
+    // summary status alone is easy to miss at 00:00.
+    var missed = jobs.filter(function (j) { return !(j.ok || j.directWon); });
+    if (missed.length && okJobs.length) {
+      notify("Padel: часть слотов не занята",
+        "Не забронировано: " + missed.map(function (j) { return j.time; }).join(", ") + ". Проверь вкладку.", true);
     }
     await setState("idle");
   }
 
   async function grabNow(myGen) {
+    // A capture may have just clicked Book on a sacrificial slot; grabJob would
+    // disarm the swallow and let that request through, booking a slot nobody
+    // asked for. It settles in ~6s at the worst, and this is a manual action.
+    if (capturePending) {
+      log("book-now waiting for an in-flight capture to settle first");
+      await Promise.race([capturePending.promise, sleep(7000)]);
+      if (!live(myGen)) return;
+    }
     var st = await get([CFG_KEY]);
     if (!live(myGen)) return;
     var cfg = st[CFG_KEY] || {};
@@ -1303,8 +1499,37 @@
   }
 
   // ---------- lifecycle ----------
+  // A config edit while armed used to be invisible to the running loop (which
+  // snapshots jobs at start) yet WAS adopted by a reload or a re-arm — so what
+  // got booked depended on invisible timing. Now an edit restarts the run,
+  // debounced because the popup autosaves on every keystroke.
+  var cfgRestartTimer = null;
+  function scheduleCfgRestart() {
+    if (cfgRestartTimer) clearTimeout(cfgRestartTimer);
+    cfgRestartTimer = setTimeout(async function () {
+      cfgRestartTimer = null;
+      var st = await get([STATE_KEY]);
+      if (st[STATE_KEY] !== "armed") return;
+      // Not in the last stretch: restarting there would throw away prepared
+      // shots (jobs are rebuilt with prepared=false) with no time to redo them.
+      var left = msToRollover();
+      if (left > 0 && left < directPrepLeadMs(2) + 5000) {
+        log("config changed close to the rollover — keeping the armed snapshot for tonight");
+        setStatus("Изменения применятся после полуночи — сейчас бронирую по старым настройкам", "warn");
+        return;
+      }
+      runGen++;
+      log("config changed — restarting the run (runGen " + runGen + ")");
+      fireAtMs = 0;
+      toInject("cancel-fire");
+      startPolling(runGen);
+    }, 2000);
+  }
+
   chrome.storage.onChanged.addListener(function (changes, area) {
-    if (area !== "local" || !changes[STATE_KEY]) return;
+    if (area !== "local") return;
+    if (changes[CFG_KEY] && !changes[STATE_KEY]) { scheduleCfgRestart(); return; }
+    if (!changes[STATE_KEY]) return;
     var s = changes[STATE_KEY].newValue;
     runGen++;                    // bump => any running poll/grab loop bails at once
     log("state changed ->", s, "(runGen " + runGen + ")");
@@ -1324,7 +1549,14 @@
     log("boot, state =", s);
     runGen++;
     if (s === "armed") startPolling(runGen);
-    else if (s === "grab") grabNow(runGen);
+    else if (s === "grab") {
+      // "grab" is a momentary command, never a state to resume. Booking is
+      // driven on the already-open tab, so a "grab" seen at page load is a
+      // leftover from a tab closed mid-booking — resuming it would book
+      // automatically on any future visit to the calendar.
+      log("stale 'grab' state at load — clearing it instead of booking");
+      await setState("idle");
+    }
   }
 
   boot();

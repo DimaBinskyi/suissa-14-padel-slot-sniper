@@ -79,7 +79,10 @@
     }
     delete prepared[id];      // single-use token; never fire the same one twice
     var t0 = Date.now();
-    var p = fetch(req.url, {
+    // origFetch, NOT the patched window.fetch: the hook would classify our own
+    // shot as a booking call and post a booking-result, which a UI grab waiting
+    // on its own Book click would consume as its result.
+    var p = (origFetch || fetch).call(window, req.url, {
       method: req.method,
       headers: req.headers,
       body: req.body,
@@ -97,13 +100,31 @@
     });
   }
 
-  // Replace a number/date string only at non-digit boundaries, so an epoch is
-  // never rewritten inside a longer number.
-  function replaceNum(body, find, repl) {
-    var n = 0;
-    var re = new RegExp("(^|[^0-9])" + find + "(?=[^0-9]|$)", "g");
-    var out = body.replace(re, function (m, pre) { n++; return pre + repl; });
-    return { body: out, n: n };
+  // Rewrite every sacrificial identifier to its target counterpart in ONE pass.
+  //
+  // A pass per pattern would re-match text an earlier pattern just wrote: with a
+  // sacrificial slot 90 min before the target, pattern 0 turns the start epoch
+  // into the target's, and pattern 1 (looking for sacrificial-start + 90 min,
+  // which now equals it) rewrites it again — producing a request that books the
+  // wrong slot while still looking like a success. Alternation in one pass
+  // cannot do that. Longest needle first so the seconds form never matches
+  // inside the milliseconds form.
+  function replaceAllNums(body, pairs) {
+    var map = {}, alts = [];
+    pairs.forEach(function (p) {
+      if (!p || !p[0] || map[p[0]] !== undefined) return;
+      map[p[0]] = p[1];
+      alts.push(String(p[0]));
+    });
+    if (!alts.length) return { body: body, counts: {} };
+    alts.sort(function (a, b) { return b.length - a.length; });
+    var counts = {};
+    var re = new RegExp("(^|[^0-9])(" + alts.join("|") + ")(?=[^0-9]|$)", "g");
+    var out = body.replace(re, function (m, pre, hit) {
+      counts[hit] = (counts[hit] || 0) + 1;
+      return pre + map[hit];
+    });
+    return { body: out, counts: counts };
   }
 
   // Same console as the content script (both log into the page), tagged so the
@@ -145,14 +166,21 @@
 
   XMLHttpRequest.prototype.send = function (body) {
     var kind = classify(this.__pUrl);
-    if (kind === "book" && suppressActive()) {
+    if (kind === "book" && suppressActive() && !bookingTemplate) {
       captureBooking(this.__pUrl, this.__pMethod, this.__pHeaders, body);
-      // Swallow EVERY booking-service call while capture is armed: the page
-      // must never actually book the sacrificial slot.
+      // Swallow the call we are here to capture: the page must never actually
+      // book the sacrificial slot. Only the FIRST one — see below.
       log("SWALLOWED the page's booking XHR (nothing was booked)");
       return;
     }
-    if (kind === "book") log("page is sending its own booking XHR (real booking)");
+    // Once a capture has been taken, stop swallowing. A second booking call
+    // during the swallow window is a booking the user actually wants (the UI
+    // grab, or a manual click), and eating it would silently lose the slot.
+    if (kind === "book" && suppressActive()) {
+      log("booking XHR passed through — capture already taken, this one is real");
+    } else if (kind === "book") {
+      log("page is sending its own booking XHR (real booking)");
+    }
     if (kind === "slots") {
       template = {
         url: this.__pUrl,
@@ -164,17 +192,23 @@
     }
     if (kind) {
       var self = this;
+      // sentAt lets the content script ignore a booking result belonging to a
+      // request that was already in flight before it started waiting — without
+      // it, one job's response resolves the next job's wait and reports a
+      // booking that never happened.
+      var sentAt = Date.now();
       this.addEventListener("load", function () {
         var text = "";
         try { text = self.responseText || ""; } catch (e) { /* opaque */ }
         if (kind === "slots") {
           post({ type: "slots", status: self.status, body: text, replayed: false });
         } else {
-          post({ type: "booking-result", status: self.status, body: text.slice(0, 800) });
+          post({ type: "booking-result", status: self.status, body: text.slice(0, 800), sentAt: sentAt });
         }
       });
       this.addEventListener("error", function () {
-        post({ type: kind === "slots" ? "slots" : "booking-result", status: 0, body: "", error: "xhr-error" });
+        if (kind === "slots") post({ type: "slots", status: 0, body: "", error: "xhr-error" });
+        else post({ type: "booking-result", status: 0, body: "", error: "xhr-error", sentAt: sentAt });
       });
     }
     return XS.apply(this, arguments);
@@ -186,7 +220,7 @@
     window.fetch = function (input, init) {
       var url = (input && input.url) ? input.url : input;
       var kind = classify(typeof url === "string" ? url : "");
-      if (kind === "book" && suppressActive()) {
+      if (kind === "book" && suppressActive() && !bookingTemplate) {
         captureBooking(url, init && init.method, init && init.headers, init && init.body);
         return new Promise(function () {}); // swallowed; never settles
       }
@@ -219,23 +253,43 @@
     if (!d || d.__padel !== "content") return;
 
     if (d.cmd === "replay") {
-      if (!template) { post({ type: "slots", status: 0, body: "", replayed: true, note: "no-template" }); return; }
+      // rid pairs each reply with its request: several replays can be in flight
+      // at once (the radar plus the midnight verification), and without it the
+      // first response to arrive resolves every waiter.
+      var rid = d.rid || 0;
+      if (!template) { post({ type: "slots", status: 0, body: "", replayed: true, rid: rid, note: "no-template" }); return; }
       var tSent = Date.now();
-      fetch(template.url, {
+      // origFetch, so our own replay is not re-observed by the fetch hook
+      // (which would double-post it and re-run detection on every response).
+      (origFetch || fetch).call(window, template.url, {
         method: template.method,
         headers: template.headers,
         body: template.body,
         credentials: "include"
       }).then(function (r) {
-        // The Date header lets the content script sync to GOOGLE's clock: the
-        // midnight rollover happens on the server's time, not this machine's.
-        var dh = r.headers.get("date");
+        // `Date` is NOT a CORS-safelisted response header and this endpoint is
+        // cross-origin, so this is usually null — see clock-probe for the
+        // same-origin fallback that actually works.
+        var dh = null;
+        try { dh = r.headers.get("date"); } catch (e2) { dh = null; }
         return r.text().then(function (t) {
-          post({ type: "slots", status: r.status, body: t, replayed: true, dateHeader: dh, tSent: tSent, tRecv: Date.now() });
+          post({ type: "slots", status: r.status, body: t, replayed: true, rid: rid, dateHeader: dh, tSent: tSent, tRecv: Date.now() });
         });
       }).catch(function (err) {
-        post({ type: "slots", status: 0, body: "", replayed: true, error: String(err) });
+        post({ type: "slots", status: 0, body: "", replayed: true, rid: rid, error: String(err) });
       });
+    } else if (d.cmd === "clock-probe") {
+      // A same-origin request whose only purpose is a READABLE Date header, so
+      // the rollover is scheduled on Google's clock instead of this machine's.
+      var pSent = Date.now();
+      (origFetch || fetch).call(window, location.origin + "/favicon.ico", { method: "GET", cache: "no-store" })
+        .then(function (r) {
+          var dh2 = null;
+          try { dh2 = r.headers.get("date"); } catch (e3) { dh2 = null; }
+          post({ type: "clock-sample", dateHeader: dh2, tSent: pSent, tRecv: Date.now(), status: r.status });
+        }).catch(function (err) {
+          post({ type: "clock-sample", dateHeader: null, tSent: pSent, tRecv: Date.now(), error: String(err) });
+        });
     } else if (d.cmd === "suppress-booking-on") {
       suppress = { needle: d.needle || "", until: Date.now() + 20000 };
       // Each capture must be fresh — the reCAPTCHA token inside is short-lived
@@ -251,23 +305,42 @@
       suppress = null;
     } else if (d.cmd === "prepare-direct") {
       var id = d.id || "a";
-      if (!bookingTemplate) { post({ type: "direct-prepared", id: id, ok: false, counts: [] }); return; }
-      var pb = bookingTemplate.body, counts = [];
-      (d.repl || []).forEach(function (pair) {
-        var r2 = replaceNum(pb, pair[0], pair[1]);
-        pb = r2.body;
-        counts.push(r2.n);
+      if (!bookingTemplate) {
+        delete prepared[id];
+        post({ type: "direct-prepared", id: id, ok: false, counts: [] });
+        return;
+      }
+      var pairs = d.repl || [];
+      var res = replaceAllNums(bookingTemplate.body, pairs);
+      var counts = pairs.map(function (p) { return res.counts[p[0]] || 0; });
+      // The start epoch must have been rewritten (otherwise we do not
+      // understand this body at all) AND no sacrificial identifier may survive
+      // anywhere in it. The second half is the real safety property: a body
+      // that still names the sacrificial slot could book it instead of the
+      // target. Anything else — a duration field we failed to find, an opaque
+      // slot token — leaves a needle behind and we refuse to fire.
+      var startHit = ((counts[0] || 0) + (counts[2] || 0)) >= 1;
+      // Values the rewritten body is SUPPOSED to contain. A sacrificial id can
+      // coincide with one of them — the target's start epoch equals the
+      // sacrificial end epoch whenever the two slots are adjacent — and then
+      // its presence is correct, not a leftover.
+      var targetVals = {};
+      pairs.forEach(function (p) { if (p) targetVals[String(p[1])] = true; });
+      var leftovers = [];
+      pairs.forEach(function (p) {
+        var find = String(p[0]);
+        if (targetVals[find]) return;
+        if (new RegExp("(^|[^0-9])" + find + "(?=[^0-9]|$)").test(res.body)) leftovers.push(find);
       });
-      // counts[0]/[2] are the start epoch in ms/seconds form — one must have hit,
-      // otherwise we don't understand the body and must not fire it.
-      var okPrep = ((counts[0] || 0) + (counts[2] || 0)) >= 1;
-      if (okPrep) prepared[id] = { url: bookingTemplate.url, method: bookingTemplate.method, headers: bookingTemplate.headers, body: pb };
+      var okPrep = startHit && !leftovers.length;
+      if (okPrep) prepared[id] = { url: bookingTemplate.url, method: bookingTemplate.method, headers: bookingTemplate.headers, body: res.body };
       else delete prepared[id];
-      log("prepare-direct[" + id + "]: " + (okPrep ? "OK" : "FAILED — start epoch not found in body") +
+      log("prepare-direct[" + id + "]: " + (okPrep ? "OK" : "FAILED — " +
+            (!startHit ? "start epoch not found in body" : "sacrificial ids still present: " + leftovers.join(","))) +
           ", replacements per pattern = [" + counts.join(",") + "], armed jobs now: [" + Object.keys(prepared).join(",") + "]");
       // Consumed: the next job must capture its own token rather than reuse it.
       bookingTemplate = null;
-      post({ type: "direct-prepared", id: id, ok: okPrep, counts: counts });
+      post({ type: "direct-prepared", id: id, ok: okPrep, counts: counts, leftovers: leftovers });
     } else if (d.cmd === "arm-fire") {
       // MAIN and ISOLATED worlds share ONE thread, and postMessage delivery
       // costs an event-loop turn — a "fire now" message would have to queue

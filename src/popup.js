@@ -43,8 +43,12 @@ function writeDate(iso) {
   var dt = m ? { y: m[1], mo: m[2], d: m[3] } : defaultDate();
   el("yyyy").value = dt.y; el("mm").value = dt.mo; el("dd").value = dt.d;
 }
+// The rollover opens today+2, so that is the only date a fresh arm can be
+// waiting FOR. Defaulting to today left first-time users armed for a day that
+// can never open, with no direct shot and no explanation.
 function defaultDate() {
   var t = new Date();
+  t.setDate(t.getDate() + 2);
   return { y: String(t.getFullYear()), mo: pad(t.getMonth() + 1), d: pad(t.getDate()) };
 }
 
@@ -135,8 +139,16 @@ async function deleteProfile() {
   profiles = profiles.filter(function (x) { return x.id !== p.id; });
   if (!profiles.length) profiles = [blankProfile()];
   activeProfileId = profiles[0].id;
+  var secondWasDeleted = el("secondProfile").value === p.id;
   renderProfileSelect();
   fillInfoInputs(activeProfile());
+  // The second booking silently re-pointed to a substitute profile while the
+  // preview kept describing the deleted person — the exact mix-up the preview
+  // exists to prevent. Say it out loud and refresh the preview.
+  renderSecondPreview();
+  if (secondWasDeleted && el("secondOn").checked) {
+    alert("Профиль второй брони удалён — проверь, кто выбран вместо него.");
+  }
   await saveProfiles();
   await saveCfg();
 }
@@ -150,6 +162,7 @@ function onInfoEdit() {
     var sel = el("profileSelect");
     if (sel.selectedIndex >= 0) sel.options[sel.selectedIndex].text = profileLabel(p, sel.selectedIndex);
     renderSecondProfile();     // labels follow the name as it's typed
+    renderSecondPreview();     // ...and so does the second booking's summary
     saveProfiles();
   }
   saveCfg();
@@ -238,11 +251,21 @@ async function saveCfg() {
 // Returns an error string, or "" when the config can be armed.
 function cfgProblem(cfg) {
   if (!cfg.targetDate || !cfg.targetTime) return "Заполни дату и время.";
+  // An empty name/email books a blank form, so require both here rather than
+  // finding out at midnight.
+  if (!cfg.firstName || !cfg.email) return "Заполни имя и email для первой брони.";
   if (cfg.second) {
     if (cfg.second.time === cfg.targetTime) return "Второй слот должен быть на другое время.";
-    if (!cfg.second.email && !cfg.second.firstName) return "Выбери профиль для второго слота.";
+    if (!cfg.second.firstName || !cfg.second.email) return "У профиля второй брони нет имени или email.";
   }
   return "";
+}
+
+// Not an error — the court has accepted two slots on one email before — but
+// worth one confirmation, since it is usually an unchanged default.
+function confirmIfSameIdentity(cfg) {
+  if (!cfg.second || cfg.second.email !== cfg.email) return true;
+  return confirm("Обе брони на один профиль (" + cfg.email + "). Продолжить?");
 }
 
 async function toggle() {
@@ -255,6 +278,7 @@ async function toggle() {
     var cfg = readForm();
     var bad = cfgProblem(cfg);
     if (bad) { log("ARM rejected:", bad); alert(bad); return; }
+    if (!confirmIfSameIdentity(cfg)) { log("ARM cancelled at the same-identity confirmation"); return; }
     log("ARM requested:", cfg.targetDate, cfg.targetTime + (cfg.second ? " + " + cfg.second.time : ""));
     await set({ cfg: cfg, state: "armed", status: { text: "Ожидание слота…", level: "info" } });
   }
