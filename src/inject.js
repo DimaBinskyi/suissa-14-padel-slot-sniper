@@ -8,11 +8,12 @@
 //
 // Responsibilities:
 //   1. Capture the ListAvailableSlots request as a replay template (verbatim
-//      url + method + headers + body, so auth/API-key are preserved).
-//   2. Forward every availability response and booking-RPC result to the
-//      ISOLATED content script via window.postMessage.
-//   3. Replay the captured request on demand (the "radar B" poll) without
-//      reloading the page.
+//      url + method + headers + body, so auth/API-key are preserved), and
+//      replay it on demand — the post-shot availability check.
+//   2. During a capture, swallow the page's own BookSlot request and keep it
+//      as the direct-shot template (see below).
+//   3. Fire the prepared requests at the deadline the content script hands
+//      over, and report each one's HTTP result.
 (function () {
   "use strict";
 
@@ -68,7 +69,6 @@
     post({ type: "booking-captured", ok: true });
   }
 
-  var bookSeq = 0;            // correlates booking-sent with booking-result
   var FIRE_SPIN_MS = 6;       // busy-wait tail that absorbs timer lateness
   var TOKEN_TTL_MS = 110000;  // reCAPTCHA tokens live ~2min; past that a send is pointless
   // Bumped by every arm-fire and cancel-fire, so a pending timer that is no
@@ -87,9 +87,8 @@
     }
     delete prepared[id];      // single-use token; never fire the same one twice
     var t0 = Date.now();
-    // origFetch, NOT the patched window.fetch: the hook would classify our own
-    // shot as a booking call and post a booking-result, which a UI grab waiting
-    // on its own Book click would consume as its result.
+    // origFetch, NOT the patched window.fetch: the hook classifies booking
+    // calls, and our own shot must never be mistaken for a page Book click.
     var p = (origFetch || fetch).call(window, req.url, {
       method: req.method,
       headers: req.headers,
@@ -100,11 +99,13 @@
     p.then(function (r) {
       return r.text().then(function (t) {
         log("fire[" + id + "] <- " + r.status + " in " + (Date.now() - t0) + "ms: " + t.slice(0, 300));
-        post({ type: "direct-book-result", id: id, status: r.status, body: t.slice(0, 800) });
+        post({ type: "direct-book-result", id: id, status: r.status, body: t.slice(0, 800),
+               sentAt: t0, ms: Date.now() - t0 });
       });
     }).catch(function (err) {
       log("fire[" + id + "] network error after " + (Date.now() - t0) + "ms: " + String(err));
-      post({ type: "direct-book-result", id: id, status: 0, body: "", error: String(err) });
+      post({ type: "direct-book-result", id: id, status: 0, body: "", error: String(err),
+             sentAt: t0, ms: Date.now() - t0 });
     });
   }
 
@@ -182,8 +183,8 @@
       return;
     }
     // Once a capture has been taken, stop swallowing. A second booking call
-    // during the swallow window is a booking the user actually wants (the UI
-    // grab, or a manual click), and eating it would silently lose the slot.
+    // during the swallow window is a booking the user actually wants (a manual
+    // click), and eating it would silently lose the slot.
     if (kind === "book" && suppressActive()) {
       log("booking XHR passed through — capture already taken, this one is real");
     } else if (kind === "book") {
@@ -196,37 +197,6 @@
         headers: this.__pHeaders || {},
         body: (typeof body === "string") ? body : null
       };
-      post({ type: "captured" });
-    }
-    if (kind) {
-      var self = this;
-      // sentAt lets the content script ignore a booking result belonging to a
-      // request that was already in flight before it started waiting — without
-      // it, one job's response resolves the next job's wait and reports a
-      // booking that never happened. seq correlates a result with the exact
-      // send it came from, which is what lets the booking queue move on as
-      // soon as a request is in flight.
-      var sentAt = Date.now();
-      var seq = (kind === "book") ? ++bookSeq : 0;
-      if (kind === "book") {
-        // The page has handed this request to the network stack: it can no
-        // longer be called back, so whatever happens to the DOM from here on
-        // cannot undo the booking.
-        post({ type: "booking-sent", seq: seq, sentAt: sentAt });
-      }
-      this.addEventListener("load", function () {
-        var text = "";
-        try { text = self.responseText || ""; } catch (e) { /* opaque */ }
-        if (kind === "slots") {
-          post({ type: "slots", status: self.status, body: text, replayed: false });
-        } else {
-          post({ type: "booking-result", seq: seq, status: self.status, body: text.slice(0, 800), sentAt: sentAt });
-        }
-      });
-      this.addEventListener("error", function () {
-        if (kind === "slots") post({ type: "slots", status: 0, body: "", error: "xhr-error" });
-        else post({ type: "booking-result", seq: seq, status: 0, body: "", error: "xhr-error", sentAt: sentAt });
-      });
     }
     return XS.apply(this, arguments);
   };
@@ -241,25 +211,15 @@
         captureBooking(url, init && init.method, init && init.headers, init && init.body);
         return new Promise(function () {}); // swallowed; never settles
       }
-      var p = origFetch.apply(this, arguments);
-      if (kind) {
-        p.then(function (res) {
-          if (kind === "slots" && template === null) {
-            template = {
-              url: url,
-              method: (init && init.method) || "POST",
-              headers: (init && init.headers) || {},
-              body: (init && typeof init.body === "string") ? init.body : null
-            };
-            post({ type: "captured" });
-          }
-          res.clone().text().then(function (t) {
-            if (kind === "slots") post({ type: "slots", status: res.status, body: t, replayed: false });
-            else post({ type: "booking-result", status: res.status, body: t.slice(0, 800) });
-          }).catch(function () {});
-        }).catch(function () {});
+      if (kind === "slots" && template === null) {
+        template = {
+          url: url,
+          method: (init && init.method) || "POST",
+          headers: (init && init.headers) || {},
+          body: (init && typeof init.body === "string") ? init.body : null
+        };
       }
-      return p;
+      return origFetch.apply(this, arguments);
     };
   }
 
@@ -270,14 +230,13 @@
     if (!d || d.__padel !== "content") return;
 
     if (d.cmd === "replay") {
-      // rid pairs each reply with its request: several replays can be in flight
-      // at once (the radar plus the midnight verification), and without it the
-      // first response to arrive resolves every waiter.
+      // rid pairs each reply with its request: a timed-out verification and
+      // its retry can both be in flight, and without it the first response to
+      // arrive resolves every waiter.
       var rid = d.rid || 0;
       if (!template) { post({ type: "slots", status: 0, body: "", replayed: true, rid: rid, note: "no-template" }); return; }
       var tSent = Date.now();
-      // origFetch, so our own replay is not re-observed by the fetch hook
-      // (which would double-post it and re-run detection on every response).
+      // origFetch, so our own replay is not re-observed by the fetch hook.
       (origFetch || fetch).call(window, template.url, {
         method: template.method,
         headers: template.headers,
@@ -376,8 +335,6 @@
         // Late (throttled tab, machine asleep) is NOT a reason to hold back:
         // a stale token just gets rejected, while not firing guarantees no
         // booking. Only give up past the reCAPTCHA TTL, where it cannot work.
-        // Double-booking is not a concern here — a completed booking flips the
-        // state, and every state change sends cancel-fire.
         var late = Date.now() - at;
         if (late > TOKEN_TTL_MS) {
           log("fire skipped: " + (late / 1000).toFixed(1) + "s late, past the token TTL (tab throttled or machine asleep?)");
@@ -394,8 +351,6 @@
       fireGen++;
     } else if (d.cmd === "direct-book") {
       firePrepared(d.id || "a");
-    } else if (d.cmd === "ping") {
-      post({ type: "pong", hasTemplate: !!template });
     }
   });
 

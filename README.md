@@ -1,143 +1,76 @@
 # Padel Slot Sniper
 
-A Chrome extension (Manifest V3) that watches a **Google Calendar Appointment
-Schedule** booking page and grabs a slot the moment it opens at midnight, then
-books it through the **real UI** (so the page generates its own reCAPTCHA token).
-If a captcha *challenge* appears, it stops and sends you a desktop notification
-instead of trying to defeat it.
+A Chrome extension (Manifest V3) for a **Google Calendar Appointment Schedule**
+booking page. At the midnight a date opens, it fires a booking request it
+captured from the page itself ~30 s earlier — the booking reaches Google one
+round-trip after the rollover. If a captcha *challenge* appears during the
+capture, it stops and sends you a desktop notification instead of trying to
+defeat it.
 
 Built for the "Padel Suiza 14" court page, but works with any Google Calendar
 appointment schedule.
 
-## How it works
+**Direct shot only (v0.4).** There is no UI booking path any more — no radar,
+no click-through-the-grid fallback, no "book now" button. If the shot misses,
+nothing else books; the popup tells you exactly what the server answered.
 
-Two-part design, because reconnaissance of the live page showed:
+## What the live page looks like
 
 - Availability is fetched via a gRPC-web **XHR** to
   `calendar-pa.clients6.google.com/.../AppointmentBookingService/ListAvailableSlots`.
+- Booking is
+  `.../google.internal.calendar.v1.AppointmentBookingService/BookSlot` (note the
+  **dot** before the service name). Its body carries `[[<startEpochSeconds>], 90]`
+  — a start epoch in **seconds** plus a duration in minutes. Auth rides on
+  cookies, which is why the shot needs `credentials: "include"`.
 - The Calendar bundle **caches `XMLHttpRequest.prototype.send` at load**, so a
   hook installed after boot never fires. It must run at `document_start`.
-- The slot grid does **not** auto-refresh; new midnight slots only appear when
-  the app re-fetches.
-- Booking flow: click date → click time → modal with **First name / Last name /
-  Email / Flat number** → **Book** button, which carries an invisible reCAPTCHA
-  (`textarea[name="g-recaptcha-response"]`).
+- Booking modal: **First name / Last name / Email / Flat number** → **Book**,
+  which carries an invisible reCAPTCHA. The page mints the token itself.
 
-So (FAST MODE — no page reload):
+## How it works
 
-1. **`inject.js`** (MAIN world, `document_start`) hooks XHR/fetch. It captures
-   the `ListAvailableSlots` request as a verbatim replay template, forwards every
-   availability response + booking-RPC result to the content script, and can
-   replay the request on demand.
-2. **`content.js`** (ISOLATED world) orchestrates, states in `chrome.storage.local`:
-   - `armed` — every ~1 s (fixed; arm it near the catch) it
-     **clicks a date in the calendar** (the nearest available one to the target,
-     alternating to bust the SPA cache). That makes the app re-fetch + re-render
-     the grid **without a page reload**. It then checks, authoritatively, whether
-     the target slot opened via: the intercepted `ListAvailableSlots` response, a
-     cache-free replay, and the grid marking the target `data-date` cell available.
-   - On detection it **grabs on the same page**: select the target date
-     (`td[data-date="YYYYMMDD"]`), click the exact time, and — because the HTML can
-     lag the response — **retry** until the slot renders. Each candidate is
-     verified against the modal header (`July 8` etc.) so a same-time slot on a
-     neighbouring day is never booked. Then fill the form and click **Book**.
-   - `grab` — run that grab immediately (used by "Забронировать сейчас").
+1. **`inject.js`** (MAIN world, `document_start`) hooks XHR/fetch. It keeps the
+   `ListAvailableSlots` request as a replay template, swallows the page's own
+   `BookSlot` request during a capture, and fires prepared requests on a
+   deadline.
+2. **`content.js`** (ISOLATED world) orchestrates. States in `chrome.storage.local`:
+   `idle` and `armed`. While armed:
+   - **Waiting** — keep an open day parked in view (the capture needs a slot
+     button on screen) and force one app fetch every ~35 s so the replay
+     template's time-bound credentials stay fresh.
+   - **Clock sync** — `Date` headers from a same-origin probe give an NTP-style
+     `server − local` offset; midnight is scheduled on that estimate.
+   - **Capture (T−20 s, +12 s per extra slot)** — open the booking modal on any
+     *currently open* (sacrificial) slot, fill the real data, and click **Book**
+     while the hook **swallows** the outgoing request. We keep the complete
+     request the page built (headers + body incl. the fresh token). Nothing is
+     booked. A captcha challenge here notifies you and waits for whatever time
+     remains; the tool never solves or bypasses it.
+   - **Retarget** — the sacrificial slot's epochs (ms and seconds forms,
+     digit-boundary-safe, single pass) and `YYYYMMDD` are rewritten to the
+     target. Any sacrificial id left in the body aborts that shot.
+   - **Fire (corrected midnight + 120 ms)** — all prepared requests leave in the
+     same tick.
+   - **Report** — a 200 counts as a win only once an availability replay shows
+     the slot gone. Each slot's verdict, HTTP status, send time and the server's
+     answer go to the popup status, a notification, and `lastShot` in storage.
+     Then the extension disarms.
 3. **`background.js`** turns events into desktop notifications (with sound).
 
-No full page reload happens at all: waiting and grabbing both drive the app's own
-fetch by clicking the calendar, saving the ~3–5 s SPA boot a reload would cost.
+A date that is already bookable (or whose midnight has passed) is refused at
+arm time: the shot only exists at the rollover that opens it.
 
-## Direct shot (v0.2)
+## Two slots at once
 
-The UI grab needs ~0.5 s after the rollover (detect → render → click → fill →
-Book) — and on 2026-09-21 that lost the race to a faster rival. On the night the
-target date opens (and only with auto-Book on), a third worker now runs:
+Tick **«Вторая бронь»** in the popup to book two times on the same date at one
+midnight, each with its own profile. A rollover opens exactly one new day, so
+both jobs share the date. Captures are sequential (one modal in the DOM, and a
+reCAPTCHA token is single-use), so the second one starts 12 s earlier —
+`T−32 s` for two slots. At the rollover both requests leave together.
 
-1. **Clock sync** — every replayed availability response carries a `Date`
-   header; an NTP-style median gives `server − local` offset, so midnight is
-   scheduled on **Google's clock**, not the Mac's.
-2. **Capture (~T−20 s)** — open the booking modal on any *currently open*
-   (sacrificial) slot, fill the real data, and click **Book** while the network
-   hook **swallows** the outgoing booking RPC. The page itself validates the
-   form and mints its own invisible-reCAPTCHA token; we keep the complete
-   request it built (headers incl. fresh SAPISIDHASH + body incl. the token)
-   and discard the modal. Nothing is booked. If a captcha *challenge* pops up
-   here, you get a notification and whatever time remains before midnight
-   (~10 s with the tight 20 s lead) to solve it — solving lets the capture
-   complete; the tool never solves or bypasses it. A slow capture or an
-   unsolved challenge just means no direct shot that night; the UI path is
-   unaffected.
-3. **Retarget** — the sacrificial slot's start/end epochs (ms and seconds
-   forms, digit-boundary-safe) and `YYYYMMDD` are rewritten to the target slot.
-   If the start epoch isn't found in the body, the direct shot is aborted.
-4. **Fire (T+120 ms after corrected midnight)** — send the prepared request
-   via `fetch`. The booking reaches Google one RTT after the rollover instead
-   of ~0.6 s. Simultaneously the target day is clicked and a replay burst
-   feeds the radar, so the classic UI grab runs **independently in parallel**
-   — neither path ever waits on the other. If both land, the worst case is a
-   duplicate booking to cancel by hand. A 200 is only trusted after a
-   follow-up availability check confirms the slot is gone; if the direct shot
-   booked first, the UI path labels its outcome "уже забронирован прямым
-   запросом" instead of treating the slot as stolen, and if a rival got it
-   you get a "перехвачен" notification instead of a silent hang.
-
-## Two slots at once (v0.3)
-
-Tick **«Второй слот»** in the popup to book two times on the same date at one
-midnight, each with its own profile (e.g. a different resident). A rollover
-opens exactly one new day, so both jobs share the date and differ in time +
-identity.
-
-The two paths scale very differently, which is the whole point:
-
-- **Direct shot — truly parallel.** Captures are sequential (one modal in the
-  DOM, and a reCAPTCHA token is single-use), so each extra slot pushes the
-  capture lead back by 12 s — `T−20 s` for one slot, `T−32 s` for two. Only the
-  first token pays the full wait. At the rollover **both requests leave in the
-  same tick**, so both bookings land ~one RTT after midnight.
-- **UI fallback — overlapped.** One modal at a time, but a job hands off as
-  soon as its request is **sent** rather than when it completes, so the next
-  slot's modal opens ~1 s earlier: first slot ~T+0.6 s, second ~T+1.6 s
-  (measured on the live page: a stacked modal renders 220 ms after the click).
-  The handed-off job's result is collected in the background by its request's
-  sequence number and reported when it lands.
-
-  This works because of two things measured on the live page: clicking a second
-  slot **stacks** a new `[role=dialog]` rather than swapping the existing one,
-  and after the send nothing done to the DOM can undo the booking. It
-  deliberately does *not* close the first modal — `Cancel` is `disabled` while
-  a booking submits, so closing mid-flight is impossible anyway. If no send is
-  observed within 4 s it falls back to waiting for the full outcome, so the
-  handoff can never be slower than not having it. The last job in the queue
-  always waits normally; there is nothing left to overlap with.
-
-Jobs the direct shot already won are skipped by the UI queue, and a modal left
-open by the other slot is never filled in for the wrong job — the 90-minute end
-time in the header (`8:30 – 10:00pm`) identifies which slot a dialog belongs to.
-Notifications and the final status report per slot (`Забронировано 2 из 2`).
-
-Note: firing two booking RPCs in the same millisecond is a stronger bot signal
-than one. Your logs show the schedule accepts two bookings for the same date
-from one session (2026-08-09: 20:30 and 16:00 both booked with one email), so
-separate Google accounts aren't needed — but if challenges start appearing,
-staggering the shots is the first thing to try.
-
-**Verified live on 2026-09-21** — a request captured for one slot was retargeted
-to another and accepted (HTTP 200 + booking id), while the sacrificial slot
-stayed free. The booking RPC is
-`.../google.internal.calendar.v1.AppointmentBookingService/BookSlot` (note the
-**dot** before the service name) and its body carries
-`[[<startEpochSeconds>], 90]` — a start epoch in **seconds** plus a duration in
-minutes, so only the seconds-form start is rewritten and there is no end epoch
-to match. Auth rides on cookies, which is why the replay needs
-`credentials: "include"` and only one request header.
-
-Older caveats, now settled: the booking RPC body format (epoch replacement
-counts are logged as `direct shot prepared`), whether the token survives ~20 s
-(if Google rejects it, the UI fallback still fires), and the exact
-"no longer available" wording for fail-fast detection. Keep the calendar tab
-**visible** (own window is fine) around midnight — Chrome throttles timers in
-hidden tabs and the schedule needs ms precision.
+The schedule accepts two bookings for the same date from one session
+(2026-08-09: 20:30 and 16:00 both booked with one email).
 
 ## Install (unpacked)
 
@@ -148,100 +81,67 @@ hidden tabs and the schedule needs ms precision.
 
 Requires Chrome 111+ (uses `content_scripts` `world: "MAIN"`).
 
+**After an update:** reload the extension, then **reload the calendar tab** — an
+open tab keeps running the engine it was loaded with. The popup shows the
+extension version next to its title and, underneath, the version the calendar
+tab is running (`Вкладка календаря: v0.4.0 ✓`). If they differ, reload the tab.
+
 ## Use
 
-1. Open the padel booking calendar tab (must stay open).
-2. Click the extension icon:
-   - **Дата / Время** — target slot (e.g. `2026-07-10`, `19:00`, 24-hour).
-   - **Имя / Фамилия / Email / Номер квартиры** — what to fill in the form.
-   - **Авто-жать Book** — on by default; captcha stops it and notifies you.
-3. Click **Включить ожидание** before midnight and leave the tab open.
-4. On success (or captcha) you get a desktop notification.
+1. Open the padel booking calendar tab (must stay open and **visible** around
+   midnight — Chrome throttles timers in hidden tabs).
+2. Click the extension icon, set **Дата** (the date that opens at the coming
+   midnight, i.e. today + 2), **Время** and the profile(s).
+3. Click **Включить ожидание** any time before ~T−40 s.
+4. After the shot you get a notification and a per-slot report in the popup, e.g.
+   `❌ 20:30 (Pavlo): слот заняли раньше нас (HTTP 400, отправлен T+0.154s, ответ за 90мс): …`
 
-**Забронировать сейчас** runs the booking flow immediately (reloads the tab and
-tries to book the target now) — use it to test the flow against an already-open
-slot.
-
-## Timezone note
-
-The target time is interpreted in **your machine's local timezone**, which is
-assumed to match the calendar's (Europe/Madrid for this court). If your Mac is on
-a different timezone, the exact-timestamp match may miss — but the hot-window
-"response grew" safety net still triggers, and the DOM step only ever clicks the
-button whose text equals your target time, so it never books the wrong slot.
-
-## Needs one live tuning pass
-
-Two things could not be observed without an actual midnight open / completed
-booking, and may need a small tweak the first time you run it live:
-
-- **Success detection** — `bookingConfirmed()` in `content.js` matches
-  confirmation text; we also treat a `200` from the booking RPC as success. If
-  the confirmation screen uses different wording, add it there.
-- **Captcha detection** — `captchaVisible()` looks for a visible reCAPTCHA
-  `bframe` iframe. If a challenge slips through, capture its iframe `src`/DOM and
-  adjust.
+`отправлен T+…` is measured against midnight on **this Mac's** clock (NTP-synced),
+not the corrected estimate — it is the number to compare across nights.
 
 ## One thread (why the fire path looks the way it does)
 
-The page, `inject.js` (MAIN world) and `content.js` (ISOLATED world) all run on
-the renderer's **single main thread**. Network I/O does not: once `fetch()` is
-called the request is handed to the network stack and flies regardless of what
-JS does next. So the only thing that can cost us the race is delaying the
-*moment* `fetch()` is called — and UI work does exactly that, because a date
-click runs Google's own handlers and grid re-render synchronously.
-
-That drives four decisions:
+The page, `inject.js` and `content.js` all run on the renderer's **single main
+thread**. Once `fetch()` is called the request flies regardless of what JS does
+next, so the only thing that can cost the race is delaying the *moment*
+`fetch()` is called — and DOM work does exactly that.
 
 - **`inject.js` owns the fire timer.** `content.js` sends `arm-fire` with the
-  absolute deadline ~6 s ahead, and inject fires from its own timer.
-  A "fire now" `postMessage` costs an event-loop turn, so it could queue behind
-  whatever the app is rendering at midnight.
-- **A 6 ms busy-wait tail** absorbs timer lateness (measured: 2–3 ms of
-  scheduler jitter → 0 ms). Nothing may preempt us between the deadline and the
-  send.
-- **The fallback burst is deferred** to `fireAt + 60 ms`. Previously the date
-  click ran synchronously *before* inject's queued message was delivered, so
-  our own burst delayed our own request.
-- **The turbo poker stands still** within ±250 ms of the send, so we don't
-  hand the thread to a grid re-render at the worst possible moment.
+  absolute deadline ~6 s ahead; a "fire now" `postMessage` would cost an
+  event-loop turn.
+- **A 6 ms busy-wait tail** absorbs timer lateness.
+- **No DOM work within ±10 s of the rollover** (parking and refetching stand
+  still).
 
-Remaining exposure: if the Calendar app is *already* mid-render when the
-deadline passes, we wait for it to finish — unavoidable with one thread. The
-blocking is asymmetric, though: the shot is ~1 ms of work and never meaningfully
-delays the UI path, and the UI grab only starts after detection (≥ one RTT after
-the rollover), by which time the shots are long gone.
+Invariants that were bugs once:
 
-Two invariants worth knowing, because both were bugs once:
-
-- **Time to the rollover is signed** (`msToRollover()`). The underlying
-  "ms until midnight" counts to the *next* midnight, so it jumps from ~0 to
-  ~86,400,000 the instant the rollover passes. Every gate meaning "is it near /
-  has it passed" uses the signed form; reading the raw value there inverted the
-  test at exactly the wrong moment and silently discarded the prepared shot.
-- **A win needs positive evidence.** The verification replay must come back
-  with a body that no longer contains the slot. An empty body means the
-  verification failed, not that we got it — otherwise a booking that never
-  happened is reported as done and the UI path skips its only retry.
+- **Time to the rollover is signed** (`msToRollover()`). "ms until midnight"
+  jumps from ~0 to ~86,400,000 the instant the rollover passes; every gate uses
+  the signed form.
+- **A win needs positive evidence.** An empty verification body means the check
+  failed, not that we got it.
 
 Only one tab runs the engine: each claims ownership in `chrome.storage`
 (`owner`, heartbeat every 3 s), and the others go passive rather than firing a
-duplicate shot per job.
-
-Safety, biased towards *getting the booking*: any state change sends
-`cancel-fire`, so disarming at 23:59:58 cannot leave a booking to go off at
-midnight. But a **late** fire is still sent — a stale token merely gets
-rejected, while holding back guarantees no booking — and only a send past the
-reCAPTCHA TTL (~110 s, e.g. the machine slept) is abandoned. For the same
-reason a capture is attempted with as little as 7 s left, aborting itself
-(and closing its modal) if the rollover would catch it mid-flight.
+duplicate shot per job. Any state change sends `cancel-fire`, so disarming at
+23:59:58 cannot leave a booking to go off at midnight. A **late** fire is still
+sent (a stale token merely gets rejected) unless it is past the reCAPTCHA TTL
+(~110 s, e.g. the machine slept).
 
 ## Reading the logs
 
-Everything goes through `console.log`, tagged and timestamped to the
-millisecond. Once the clock is synced, lines also carry the signed offset to
-the court's midnight (`T-12.345s` / `T+0.150s`) — that offset is the number to
-look at when tuning the shot.
+The outcome of every shot is persisted, so it survives the tab closing:
+
+- `status` — what the popup shows (the per-slot report after a shot).
+- `lastShot` — `{ fireT, clockOffsetMs, clockSamples, verified, jobs: [{ verdict,
+  http, sentT, ms, body }] }`. Verdicts: `won`, `taken`, `rejected-open` (the slot
+  is still free — book it by hand), `200-unverified`, `200-still-open`,
+  `failed`, `unprepared`.
+- `engine` — the version the calendar tab last booted with.
+
+Everything else goes through `console.log`, tagged and timestamped to the
+millisecond; once the clock is synced, engine lines carry the signed offset to
+the court's midnight (`T-12.345s` / `T+0.150s`).
 
 | Tag | Where to open it |
 |-----|------------------|
@@ -250,17 +150,14 @@ look at when tuning the shot.
 | `[padel popup …]` | popup (right-click the popup → Inspect) |
 | `[padel bg …]` | notifications (`chrome://extensions` → *service worker*) |
 
-The radar replays ~3×/s, so outside the rollover window it logs a 10-second
-heartbeat (`radar heartbeat: 33/33 ok in 10s, midnight in 214s`); inside the
-turbo window every response is logged individually. Key lines to look for on a
-live night: `clock sync: server offset …`, `booking request CAPTURED`,
-`prepare-direct[a]: OK, replacements per pattern = [1,1,0,0,2]`,
-`FIRE (scheduled drift …)`, `direct-book[a] <- 200 in 74ms`, and
-`verify 20:30 (Dmytro): http=200 slotStillOpen=false -> WON`.
+Key lines on a live night: `engine v0.4.0 loaded`, `clock sync: server offset …`,
+`booking request CAPTURED`, `prepare-direct[a]: OK, replacements per pattern = …`,
+`arm-fire: [a,b] in …ms`, `fire[a] <- 200 in 74ms`, and
+`verify 20:30 (Pavlo): http=200 verified=true slotStillOpen=false -> won`.
 
 ## Scope / ethics
 
-Personal booking automation for a single court reservation. It books through the
-normal UI and does **not** attempt to solve or bypass captchas — it defers to you
-when one appears. Automating Google Calendar may be against Google's Terms of
-Service; use on your own account and at your own risk.
+Personal booking automation for a single court reservation. It uses requests
+the page builds itself and does **not** attempt to solve or bypass captchas — it
+defers to you when one appears. Automating Google Calendar may be against
+Google's Terms of Service; use on your own account and at your own risk.

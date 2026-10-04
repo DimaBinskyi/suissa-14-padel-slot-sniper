@@ -18,7 +18,11 @@ body {
   color: var(--fg);
   background: var(--bg);
 }
-header h1 { font-size: 15px; margin: 0 0 10px; }
+header h1 { font-size: 15px; margin: 0 0 2px; }
+header .ver { font-size: 11px; font-weight: 600; color: var(--muted); }
+.engine { font-size: 11px; color: var(--muted); margin-bottom: 10px; }
+.engine.ok { color: var(--ok); }
+.engine.warn { color: var(--warn); font-weight: 600; }
 form { margin: 0; }
 label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 8px; }
 label input { display: block; }
@@ -108,6 +112,7 @@ button.secondary:hover { background: #e5e7eb; }
   background: #f9fafb;
   border: 1px solid var(--line);
   min-height: 18px;
+  white-space: pre-line;   /* the shot report is one line per slot */
 }
 .status.ok { background: #f0fdf4; border-color: #bbf7d0; color: var(--ok); }
 .status.warn { background: #fffbeb; border-color: #fde68a; color: var(--warn); }

@@ -174,7 +174,6 @@ function readForm() {
   cfg.targetDate = readDate();
   cfg.targetTime = el("targetTime").value;
   INFO.forEach(function (id) { cfg[id] = el(id).value; });
-  cfg.autoBook = el("autoBook").checked;
   // Second slot: same date, another time, booked with another profile's data.
   // Stored flat so the content script reads it without touching `profiles`.
   cfg.second = null;
@@ -190,23 +189,37 @@ function applyStatus(status, state) {
   var e = el("status");
   e.className = "status " + (status && status.level ? status.level : "");
   if (state === "idle" && !status) { e.textContent = "Выключено"; return; }
-  e.textContent = status ? status.text : (state === "armed" ? "Ожидание…" : state === "grab" ? "Бронирую…" : "Выключено");
+  e.textContent = status ? status.text : (state === "armed" ? "Ожидание…" : "Выключено");
 }
 
 function applyToggle(state) {
   var btn = el("toggle");
-  var on = (state === "armed" || state === "grab");
+  var on = state === "armed";
   btn.className = "toggle " + (on ? "on" : "off");
   btn.textContent = on ? "Выключить" : "Включить ожидание";
 }
 
+// The popup always runs the freshly loaded extension, but an open calendar tab
+// keeps the engine it was loaded with until the tab itself is reloaded. Show
+// both, so a stale tab is caught before midnight rather than after.
+function renderEngine(engine) {
+  var mine = chrome.runtime.getManifest().version;
+  var e = el("engine");
+  var ok = !!(engine && engine.version === mine);
+  e.className = "engine " + (ok ? "ok" : "warn");
+  e.textContent = ok
+    ? "Вкладка календаря: v" + engine.version + " ✓"
+    : "Вкладка календаря не на v" + mine + (engine && engine.version ? " (там v" + engine.version + ")" : "") +
+      " — открой или перезагрузи её";
+}
+
 async function restore() {
-  var st = await get(["cfg", "state", "status", "profiles", "activeProfileId"]);
+  var st = await get(["cfg", "state", "status", "profiles", "activeProfileId", "engine"]);
   var cfg = st.cfg || {};
+  renderEngine(st.engine);
   el("calendarUrl").value = DEFAULT_URL;
   writeDate(cfg.targetDate);
   if (cfg.targetTime) el("targetTime").value = cfg.targetTime;
-  el("autoBook").checked = cfg.autoBook !== false;
 
   var sec = cfg.second;
   el("secondOn").checked = !!(sec && sec.time);
@@ -231,7 +244,11 @@ async function restore() {
   if (migrated) await saveProfiles();
   // cfg stays the booking source of truth — re-sync it if it diverged.
   var ap = activeProfile();
-  if (INFO.some(function (id) { return (cfg[id] || "") !== (ap[id] || ""); })) await saveCfg();
+  // Also drops the retired UI-booking setting (autoBook) — but never while
+  // armed, where a cfg write restarts the run.
+  var legacy = ("autoBook" in cfg) && st.state !== "armed";
+  if (legacy || INFO.some(function (id) { return (cfg[id] || "") !== (ap[id] || ""); })) await saveCfg();
+  chrome.storage.local.remove("armedOffAfterBook");   // retired UI-booking flag
 
   applyToggle(st.state || "idle");
   applyStatus(st.status, st.state || "idle");
@@ -243,8 +260,7 @@ async function restore() {
 async function saveCfg() {
   var cfg = readForm();
   log("cfg saved:", "date=" + cfg.targetDate, "slot1=" + cfg.targetTime + " <" + cfg.email + "> кв." + cfg.flat,
-      cfg.second ? "slot2=" + cfg.second.time + " <" + cfg.second.email + "> кв." + cfg.second.flat : "slot2=off",
-      "autoBook=" + cfg.autoBook);
+      cfg.second ? "slot2=" + cfg.second.time + " <" + cfg.second.email + "> кв." + cfg.second.flat : "slot2=off");
   await set({ cfg: cfg });
 }
 
@@ -270,8 +286,7 @@ function confirmIfSameIdentity(cfg) {
 
 async function toggle() {
   var st = await get(["state"]);
-  var on = (st.state === "armed" || st.state === "grab");
-  if (on) {
+  if (st.state === "armed") {
     log("DISARM requested (state was " + st.state + ")");
     await set({ state: "idle", status: { text: "Выключено", level: "info" } });
   } else {
@@ -282,22 +297,6 @@ async function toggle() {
     log("ARM requested:", cfg.targetDate, cfg.targetTime + (cfg.second ? " + " + cfg.second.time : ""));
     await set({ cfg: cfg, state: "armed", status: { text: "Ожидание слота…", level: "info" } });
   }
-}
-
-async function bookNow() {
-  var cfg = readForm();
-  var problem = cfgProblem(cfg);
-  if (problem) { log("bookNow rejected:", problem); alert(problem); return; }
-  log("BOOK NOW requested:", cfg.targetDate, cfg.targetTime + (cfg.second ? " + " + cfg.second.time : ""));
-  // Fast mode: no reload. The content script grabs on the already-open tab.
-  await set({ cfg: cfg, state: "grab", status: { text: "Бронирую…", level: "info" } });
-  chrome.tabs.query({ url: "https://calendar.google.com/calendar/*/appointments/schedules/*" }, function (tabs) {
-    if (tabs && tabs[0]) {
-      chrome.tabs.update(tabs[0].id, { active: true });
-      if (tabs[0].windowId != null) chrome.windows.update(tabs[0].windowId, { focused: true });
-    }
-    window.close();
-  });
 }
 
 function openCalendar() {
@@ -312,10 +311,11 @@ function openCalendar() {
 }
 
 function init() {
+  el("ver").textContent = "v" + chrome.runtime.getManifest().version;
   buildDateSelects();
   restore();
   // Autosave: selects/checkbox on change, text inputs on every keystroke.
-  ["dd", "mm", "yyyy", "targetTime", "autoBook", "secondTime", "secondProfile"].forEach(function (id) {
+  ["dd", "mm", "yyyy", "targetTime", "secondTime", "secondProfile"].forEach(function (id) {
     el(id).addEventListener("change", saveCfg);
   });
   el("secondOn").addEventListener("change", function () {
@@ -333,7 +333,6 @@ function init() {
   el("profileDel").addEventListener("click", deleteProfile);
   el("openCal").addEventListener("click", openCalendar);
   el("toggle").addEventListener("click", toggle);
-  el("bookNow").addEventListener("click", bookNow);
 }
 
 // Run now if the DOM is already parsed, otherwise wait for it.
@@ -347,6 +346,7 @@ chrome.storage.onChanged.addListener(function (changes, area) {
     log("status[" + (s.level || "info") + "]", s.text);
   }
   if (changes.state) log("state ->", changes.state.newValue);
+  if (changes.engine) renderEngine(changes.engine.newValue);
   get(["state", "status"]).then(function (st) {
     applyToggle(st.state || "idle");
     applyStatus(st.status, st.state || "idle");

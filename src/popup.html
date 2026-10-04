@@ -8,7 +8,8 @@
 </head>
 <body>
   <header>
-    <h1>🎾 Padel Slot Sniper</h1>
+    <h1>🎾 Padel Slot Sniper <span id="ver" class="ver"></span></h1>
+    <div id="engine" class="engine"></div>
   </header>
 
   <label>Ссылка на календарь
@@ -93,19 +94,10 @@
       </div>
       <div id="secondHintOff" class="hint pad">Выключено — бронируется только первый слот.</div>
     </fieldset>
-
-    <label class="check">
-      <input type="checkbox" id="autoBook" checked />
-      Авто-жать «Book» (капча → стоп + уведомление)
-    </label>
   </form>
 
   <div class="toggle-wrap">
     <button id="toggle" class="toggle off" type="button">Включить ожидание</button>
-  </div>
-
-  <div class="row">
-    <button id="bookNow" class="secondary" type="button">Забронировать сейчас</button>
   </div>
 
   <div id="status" class="status">Выключено</div>
