@@ -76,6 +76,21 @@ fieldset.slot.second:has(#secondOn:checked) { background: #fff; border-color: va
 fieldset.slot.second .badge { background: var(--muted); }
 fieldset.slot.second:has(#secondOn:checked) .badge { background: var(--teal); }
 .check.inline { margin: 0; font-size: 11px; font-weight: 600; cursor: pointer; }
+
+/* Booking mode: a two-way segmented switch. */
+.mode { font-size: 11px; color: var(--muted); margin-bottom: 8px; }
+.seg {
+  display: grid; grid-template-columns: 1fr 1fr;
+  margin-top: 3px;
+  border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+}
+.seg label { margin: 0; font-size: 12px; color: var(--fg); cursor: pointer; }
+.seg label + label { border-left: 1px solid var(--line); }
+.seg input { position: absolute; opacity: 0; pointer-events: none; }
+.seg span { display: block; padding: 6px 4px; text-align: center; }
+.seg input:checked + span { background: var(--teal); color: #fff; font-weight: 600; }
+.seg input:focus-visible + span { outline: 2px solid var(--teal-d); outline-offset: -2px; }
+.mode-hint { display: block; margin-top: 4px; font-size: 11px; }
 .hint { font-weight: 400; color: var(--muted); }
 .hint.pad { padding: 0 0 8px; font-size: 11px; }
 .preview {

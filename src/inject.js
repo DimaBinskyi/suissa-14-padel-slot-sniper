@@ -9,10 +9,12 @@
 // Responsibilities:
 //   1. Capture the ListAvailableSlots request as a replay template (verbatim
 //      url + method + headers + body, so auth/API-key are preserved), and
-//      replay it on demand — the post-shot availability check.
-//   2. During a capture, swallow the page's own BookSlot request and keep it
+//      replay it on demand — the UI-mode radar and the post-shot check.
+//   2. Forward every availability response and booking-RPC result to the
+//      ISOLATED content script via window.postMessage (the UI grab).
+//   3. During a capture, swallow the page's own BookSlot request and keep it
 //      as the direct-shot template (see below).
-//   3. Fire the prepared requests at the deadline the content script hands
+//   4. Fire the prepared requests at the deadline the content script hands
 //      over, and report each one's HTTP result.
 (function () {
   "use strict";
@@ -69,6 +71,7 @@
     post({ type: "booking-captured", ok: true });
   }
 
+  var bookSeq = 0;            // correlates booking-sent with booking-result
   var FIRE_SPIN_MS = 6;       // busy-wait tail that absorbs timer lateness
   var TOKEN_TTL_MS = 110000;  // reCAPTCHA tokens live ~2min; past that a send is pointless
   // Bumped by every arm-fire and cancel-fire, so a pending timer that is no
@@ -198,6 +201,36 @@
         body: (typeof body === "string") ? body : null
       };
     }
+    if (kind) {
+      var self = this;
+      // sentAt lets the content script ignore a booking result belonging to a
+      // request that was already in flight before it started waiting — without
+      // it, one job's response resolves the next job's wait and reports a
+      // booking that never happened. seq correlates a result with the exact
+      // send it came from, which is what lets the booking queue move on as
+      // soon as a request is in flight.
+      var sentAt = Date.now();
+      var seq = (kind === "book") ? ++bookSeq : 0;
+      if (kind === "book") {
+        // The page has handed this request to the network stack: it can no
+        // longer be called back, so whatever happens to the DOM from here on
+        // cannot undo the booking.
+        post({ type: "booking-sent", seq: seq, sentAt: sentAt });
+      }
+      this.addEventListener("load", function () {
+        var text = "";
+        try { text = self.responseText || ""; } catch (e) { /* opaque */ }
+        if (kind === "slots") {
+          post({ type: "slots", status: self.status, body: text, replayed: false });
+        } else {
+          post({ type: "booking-result", seq: seq, status: self.status, body: text.slice(0, 800), sentAt: sentAt });
+        }
+      });
+      this.addEventListener("error", function () {
+        if (kind === "slots") post({ type: "slots", status: 0, body: "", error: "xhr-error" });
+        else post({ type: "booking-result", seq: seq, status: 0, body: "", error: "xhr-error", sentAt: sentAt });
+      });
+    }
     return XS.apply(this, arguments);
   };
 
@@ -219,7 +252,16 @@
           body: (init && typeof init.body === "string") ? init.body : null
         };
       }
-      return origFetch.apply(this, arguments);
+      var p = origFetch.apply(this, arguments);
+      if (kind) {
+        p.then(function (res) {
+          res.clone().text().then(function (t) {
+            if (kind === "slots") post({ type: "slots", status: res.status, body: t, replayed: false });
+            else post({ type: "booking-result", status: res.status, body: t.slice(0, 800) });
+          }).catch(function () {});
+        }).catch(function () {});
+      }
+      return p;
     };
   }
 
@@ -230,13 +272,14 @@
     if (!d || d.__padel !== "content") return;
 
     if (d.cmd === "replay") {
-      // rid pairs each reply with its request: a timed-out verification and
-      // its retry can both be in flight, and without it the first response to
-      // arrive resolves every waiter.
+      // rid pairs each reply with its request: several replays can be in flight
+      // at once (radar replays, a timed-out verification and its retry), and
+      // without it the first response to arrive resolves every waiter.
       var rid = d.rid || 0;
       if (!template) { post({ type: "slots", status: 0, body: "", replayed: true, rid: rid, note: "no-template" }); return; }
       var tSent = Date.now();
-      // origFetch, so our own replay is not re-observed by the fetch hook.
+      // origFetch, so our own replay is not re-observed by the fetch hook
+      // (which would double-post it and re-run detection on every response).
       (origFetch || fetch).call(window, template.url, {
         method: template.method,
         headers: template.headers,

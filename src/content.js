@@ -1,8 +1,27 @@
-// content.js — ISOLATED world orchestrator for the midnight DIRECT SHOT.
+// content.js — ISOLATED world orchestrator. Two booking modes, picked in the
+// popup (cfg.mode) — exactly one runs:
+//
+//   "direct" (default) — the midnight DIRECT SHOT, described below;
+//   "ui"               — the UI grab: replay radar + click through the grid.
 //
 // States (persisted in chrome.storage.local under "state"):
 //   idle  -> do nothing
-//   armed -> wait for the midnight rollover that opens the target date, then:
+//   grab  -> run the UI grab right now (used by "Забронировать сейчас").
+//   armed, mode "ui" -> two independent workers:
+//            * replay radar: re-send the captured ListAvailableSlots request
+//              every ~300ms and check each response for the EXACT target slot
+//              (no DOM involved, so detection latency ≈ one server roundtrip);
+//            * view parker: the day strip renders the selected day + the next
+//              6 days, so we park once on the latest available date at/before
+//              the target and never switch days — the target's column is
+//              already on screen when its slots appear, and the grab clicks
+//              them right in the strip. Every ~35s the parker forces one
+//              app-initiated fetch so the replay template's time-bound
+//              credentials (SAPISIDHASH) stay fresh.
+//            Detection is event-driven: every availability response (the app's
+//            own or a replayed one) is checked the moment it arrives.
+//   armed, mode "direct" -> wait for the midnight rollover that opens the
+//            target date, then:
 //            * ~30s before server-corrected midnight, capture the page's own
 //              booking request per job: fill the form on a SACRIFICIAL open
 //              slot, click Book, and let inject.js swallow the request before
@@ -16,8 +35,8 @@
 //            Until then the tab only keeps an open day parked in view (the
 //            capture needs a slot button on screen) and refreshes the replay
 //            template every ~35s for the post-shot check.
-//
-// There is no UI booking path: if the shot misses, nothing else books.
+//            There is no UI fallback in this mode: if the shot misses, nothing
+//            else books.
 (function () {
   "use strict";
 
@@ -56,11 +75,16 @@
   function setState(s) { return set({ state: s }); }
 
   // ---------- inject bridge ----------
-  var slotWaiters = [];      // resolved by replayed availability responses
+  var slotWaiters = [];      // resolved by REPLAYED responses only
+  var bookingWaiters = [];
+  var sentWaiters = [];      // resolved when the page's booking request goes out
+  var bookingResults = {};   // seq -> result, for a reply that beats its waiter
   var captureWaiters = [];   // resolved when inject captures a booking template
   var suppressWaiters = [];  // resolved when inject acks suppress-booking-on
   var preparedWaiters = [];  // resolved when inject finishes prepare-direct
   var directWaiters = [];    // resolved by a direct-book result
+  var lastAppSlots = { body: "", ts: 0 }; // latest APP-initiated ListAvailableSlots response
+  var onSlotsBody = null;    // UI-mode hook: called with EVERY availability body on arrival
 
   // Waiters are { fn, pred }. A waiter with a predicate only takes messages it
   // matches and stays queued otherwise — needed once two jobs have direct-shot
@@ -78,8 +102,13 @@
     var d = e.data;
     if (!d || d.__padel !== "inject") return;
     if (d.type === "slots") {
-      if (d.dateHeader) noteClockSample(d.dateHeader, d.tSent, d.tRecv);
-      flushWaiters(slotWaiters, d);
+      if (d.replayed) {
+        if (d.dateHeader) noteClockSample(d.dateHeader, d.tSent, d.tRecv);
+        flushWaiters(slotWaiters, d);
+      } else {
+        lastAppSlots = { body: d.body || "", ts: Date.now() };
+      }
+      if (onSlotsBody) onSlotsBody(d.body || "");
     } else if (d.type === "clock-sample") {
       if (d.dateHeader) noteClockSample(d.dateHeader, d.tSent, d.tRecv);
       else if (!clockProbeWarned) {
@@ -87,6 +116,13 @@
         log("clock probe returned no Date header (" + (d.error || "status " + d.status) +
             ") — scheduling on the LOCAL clock");
       }
+    } else if (d.type === "booking-sent") {
+      flushWaiters(sentWaiters, d);
+    } else if (d.type === "booking-result") {
+      // Cache by seq: a handed-off job asks for its result only after the send
+      // is announced, and a fast reply can land in between.
+      if (d.seq) bookingResults[d.seq] = d;
+      flushWaiters(bookingWaiters, d);
     } else if (d.type === "booking-captured") {
       flushWaiters(captureWaiters, d);
     } else if (d.type === "suppress-ack") {
@@ -132,6 +168,45 @@
         fn: function (d) { if (!done) { done = true; clearTimeout(t); res(d); } }
       });
       toInject({ cmd: "replay", rid: rid });
+    });
+  }
+  // Resolves the moment the page hands its booking request to the network
+  // stack. From then on the booking cannot be called back, so the queue is free
+  // to open the next slot's modal — which is ~1s earlier than waiting for the
+  // response. Carries the seq to look the matching result up with.
+  function nextBookingSent(timeoutMs) {
+    var since = Date.now();
+    return new Promise(function (res) {
+      var done = false;
+      var t = setTimeout(function () { if (!done) { done = true; res(null); } }, timeoutMs || 4000);
+      sentWaiters.push({
+        pred: function (d) { return !d || d.sentAt == null || d.sentAt >= since - 50; },
+        fn: function (d) { if (!done) { done = true; clearTimeout(t); res(d); } }
+      });
+    });
+  }
+  // Exact correlation by seq — no fence heuristics, so a handed-off job's
+  // result can never be confused with the next job's.
+  function bookingResultFor(seq, timeoutMs) {
+    if (bookingResults[seq]) {
+      var cached = bookingResults[seq];
+      delete bookingResults[seq];
+      return Promise.resolve(cached);
+    }
+    return awaitMsg(bookingWaiters, timeoutMs || 20000, null, function (d) { return d && d.seq === seq; });
+  }
+  // Only accept a booking result for a request the page sent AFTER we started
+  // waiting. One job's late response would otherwise resolve the next job's
+  // wait and report a booking that never happened.
+  function nextBookingResult(timeoutMs) {
+    var since = Date.now();
+    return new Promise(function (res) {
+      var done = false;
+      var t = setTimeout(function () { if (!done) { done = true; res(null); } }, timeoutMs || 20000);
+      bookingWaiters.push({
+        pred: function (d) { return !d || d.sentAt == null || d.sentAt >= since; },
+        fn: function (d) { if (!done) { done = true; clearTimeout(t); res(d); } }
+      });
     });
   }
 
@@ -291,6 +366,16 @@
     return r.width > 0 && r.height > 0;
   }
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  // Polls until fn() is truthy and never settles otherwise — for use as one arm
+  // of a race whose timeout belongs to a different arm.
+  function untilTrue(fn, stepMs) {
+    return new Promise(function (res) {
+      (function tick() {
+        if (fn()) return res(true);
+        setTimeout(tick, stepMs || 250);
+      })();
+    });
+  }
   function waitFor(fn, timeoutMs, step) {
     var end = Date.now() + (timeoutMs || 6000);
     return new Promise(function (res) {
@@ -351,6 +436,9 @@
     }
     return out;
   }
+  function findSlotButtons(timeMin) {
+    return slotButtonsAll().filter(function (b) { return slotTextToMinutes(b.textContent) === timeMin; });
+  }
 
   // The LAST visible dialog, never the first.
   //
@@ -381,6 +469,38 @@
     var f = formInputs();
     return (f.texts.length >= 1 && f.emails.length >= 1) ? f : null;
   }
+  // Guard against booking a neighbouring day: the modal header reads e.g.
+  // "Wednesday, July 8, 4:00 – 5:30pm". Require the target month+day to appear.
+  function modalMatchesTarget(td) {
+    var dlg = dialogEl();
+    if (!dlg) return false;
+    var txt = (dlg.textContent || "");
+    return new RegExp(MONTHS[td.m - 1] + "\\s+" + td.d + "\\b").test(txt);
+  }
+  function hhmm12(min) {
+    var h = Math.floor(min / 60) % 24, h12 = h % 12;
+    return (h12 === 0 ? 12 : h12) + ":" + pad(min % 60);
+  }
+  function meridiem(min) { return (Math.floor(min / 60) % 24) < 12 ? "am" : "pm"; }
+  // With two jobs in play, a modal left open by the OTHER slot must not be
+  // filled in for this one. The header reads "Wednesday, July 8, 4:00 – 5:30pm":
+  // the start time carries no am/pm, so the 90-min end time identifies the slot.
+  // Deliberately defensive — if no time pattern is recognisable at all we do
+  // NOT block the booking, since the slot button we clicked already matched the
+  // exact time. Only a clearly different time counts as a mismatch.
+  function modalShowsOtherTime(timeMin) {
+    var d = dialogEl();
+    if (!d) return false;
+    var t = (d.textContent || "").toLowerCase().replace(/\s+/g, "");
+    // Parse the header's range rather than hunting for one needle. Matching the
+    // END time alone accepted the wrong modal whenever a slot's end equalled
+    // another slot's start: a 10:00 job (ending 11:30am) accepted the 11:30
+    // slot's "11:30am–1:00pm" header and would have booked it.
+    var m = t.match(/(\d{1,2}:\d{2})(am|pm)?[–—-](\d{1,2}:\d{2})(am|pm)/);
+    if (!m) return /\d{1,2}:\d{2}(am|pm)/.test(t);   // unrecognised: don't block
+    var startMer = m[2] || m[4];   // omitted start meridiem means it matches the end
+    return !(m[1] === hhmm12(timeMin) && startMer === meridiem(timeMin));
+  }
   // "Wednesday, July 8, 4:00 – 5:30pm" -> {y,m,d}. The header has no year, but
   // bookable dates are never more than a couple of days out, so pick the year
   // that puts the date near today.
@@ -394,6 +514,12 @@
     if (diff < -45 * 86400000) y++;
     if (diff > 320 * 86400000) y--;
     return { y: y, m: mo, d: day };
+  }
+  // Booking raced and lost: Google swaps the modal to a "time is no longer
+  // available" notice. Spotting it beats waiting out the 20s result race.
+  function slotTakenText() {
+    var scope = dialogEl() || document.body;
+    return /no longer available|not available anymore|ya no está disponible/i.test(scope.textContent || "");
   }
   // Skips disabled buttons: Cancel is disabled while a booking is submitting
   // (measured on the live page), and clicking it would silently do nothing
@@ -460,6 +586,16 @@
     }
     return false;
   }
+  // Verified live: a completed booking renders "Booking confirmed" + "Email
+  // sent to <address>" in the dialog. Scoped to the CURRENT dialog because
+  // dialogs stack — otherwise the first job's confirmation text, still in the
+  // document, would resolve the second job's wait as if it had succeeded.
+  function bookingConfirmed() {
+    if (formIsOpen()) return false;
+    var scope = dialogEl() || document.body;
+    var txt = (scope.textContent || "").toLowerCase();
+    return /you'?re booked|booking confirmed|reserva confirmada|has reservado|cita reservada|added to your calendar/.test(txt);
+  }
   function notify(title, message, sound) {
     log("notify:", title, "|", message);
     try { chrome.runtime.sendMessage({ type: "notify", title: title, message: message, sound: !!sound }); } catch (e) {
@@ -467,14 +603,17 @@
     }
   }
 
-  // ---------- view parking (keep an open slot on screen for the capture) ----------
-  // The capture clicks Book on a sacrificial open slot, so the strip must show
-  // an open day. We park on the latest available date at/before the target and
-  // leave the view alone. forceRefetch() runs rarely — its only job is to
-  // trigger one app-initiated call so inject.js re-captures the availability
-  // template with fresh time-bound credentials (SAPISIDHASH); the post-shot
-  // check replays that template.
+  // ---------- view parking (keep target / open slots on screen, no window jumping) ----------
+  // The day strip shows the selected day PLUS the next 6 days, so the target's
+  // column is visible while we stand on an earlier day. We park once on the
+  // latest available date at/before the target and leave the view alone: in UI
+  // mode, when the target's slots open, they render right in the visible strip
+  // — no day switching needed at all; in direct mode, the capture needs an open
+  // slot on screen to click Book on. forceRefetch() runs rarely — its only job
+  // is to trigger one app-initiated call so inject.js re-captures the
+  // availability template with fresh time-bound credentials (SAPISIDHASH).
   var parkedYmd = 0;
+  var maintenanceAsap = false;
 
   // Available dates ordered by anchoring preference: dates at/before the
   // target from latest to earliest (each keeps the target inside the 7-day
@@ -508,28 +647,75 @@
 
   // Trigger one app-initiated ListAvailableSlots (re-selecting the parked day
   // may be served from the SPA cache, so select something else), then restore
-  // the parked view.
-  async function forceRefetch(td) {
+  // the parked view. The alternate pick is the next-best anchor, so the target
+  // column stays inside the strip even mid-refetch.
+  //
+  // abort() is checked before every click: the grab path watches for the slot
+  // button while this runs, and once the button renders we must stop clicking
+  // dates — a further re-render would detach the element we're about to click.
+  // The direct path passes no abort().
+  async function forceRefetch(td, abort) {
+    function stopped() { return !!(abort && abort()); }
     var avs = anchorCells(td);
     if (!avs.length) { await parkView(td); return; }
     if (avs.length > 1) {
+      if (stopped()) return;
       avs[1].btn.click();
+      parkedYmd = 0;              // aborting below must leave the view re-parkable
       await sleep(500);
     } else {
       var nd = navButton(/next day/i), pd = navButton(/previous day/i);
-      if (nd) { nd.click(); await sleep(300); }
+      if (nd && !stopped()) { nd.click(); await sleep(300); }
       var pd2 = navButton(/previous day/i) || pd;
-      if (pd2) { pd2.click(); await sleep(300); }
+      if (pd2 && !stopped()) { pd2.click(); await sleep(300); }
     }
+    if (stopped()) return;
     avs[0].btn.click();
     parkedYmd = avs[0].ymd;
+  }
+
+  // One click that is guaranteed to change the app's selected day, so it must
+  // refetch and re-render. Alternates target <-> anchor: re-selecting the same
+  // day can be served from the SPA's cache and render nothing.
+  var pokeIdx = 0;
+  function pokeApp(td) {
+    var cells = [];
+    var t = dateCellButton(ymd(td));
+    // Ungated on purpose (same reasoning as in grab): before the rollover the
+    // target still reads "no available times", and that is exactly the day we
+    // need the app to be looking at when the slots land.
+    if (t && !t.disabled && t.getAttribute("aria-disabled") !== "true") cells.push(t);
+    var avs = anchorCells(td);
+    for (var i = 0; i < avs.length && cells.length < 3; i++) {
+      if (avs[i].btn !== t) cells.push(avs[i].btn);
+    }
+    if (!cells.length) return false;
+    cells[pokeIdx++ % cells.length].click();
+    parkedYmd = 0;                  // the view moved; parkView() must re-anchor
+    return true;
+  }
+
+  // Open a booking modal once on any available slot and immediately discard it.
+  // First-open cost (lazy modal bundle + reCAPTCHA init) is ~0.5s; paying it
+  // while idle means the real grab clicks into an already-warm dialog.
+  async function prewarmModal(myGen, alive) {
+    if (dialogEl()) return;
+    var all = slotButtonsAll();
+    if (!all.length) return;
+    all[0].click();
+    var f = await waitFor(formIsOpen, 4000, 60);
+    if (f) log("booking modal prewarmed");
+    // Close it even when the run was invalidated mid-warm: bailing out early
+    // used to leave a foreign booking modal open for the grab to trip over.
+    await closeModal();
   }
 
   // ---------- jobs ----------
   // One job = one slot to book with one identity. A midnight rollover opens
   // exactly ONE new day, so every job shares cfg.targetDate and differs only
-  // in time + form data. Each job captures its own request (a reCAPTCHA token
-  // is single-use) and all prepared shots fire together.
+  // in time + form data. In direct mode each job captures its own request (a
+  // reCAPTCHA token is single-use) and all prepared shots fire together; in UI
+  // mode the grab works through them one modal at a time.
   function jobData(src) {
     return {
       firstName: src.firstName || "", lastName: src.lastName || "",
@@ -548,7 +734,7 @@
     }
     out.forEach(function (j) {
       j.label = j.time + (j.data.firstName ? " (" + j.data.firstName + ")" : "");
-      j.prepared = false;
+      j.prepared = false; j.done = false; j.ok = false;
     });
     return out;
   }
@@ -593,7 +779,32 @@
   function live(myGen) { return myGen === runGen; }
 
   // ---------- timing ----------
+  var REPLAY_MS = 300;         // UI-mode replay radar cadence (~3 req/s — fast but not abusive)
   var MAINTENANCE_MS = 35000;  // how often to force an app fetch (template freshness)
+  // UI mode: turbo window around the court's midnight rollover. Our replay
+  // tells US the slot exists but leaves the app's own state untouched, so the
+  // page still has to be nudged into redrawing — ~0.5-1s we'd rather not spend
+  // after detection. Instead, for a short window we keep poking the app so IT
+  // fetches and renders the new day by itself; by the time the radar fires,
+  // the button is on screen. The radar halves its rate meanwhile — the app's
+  // own responses feed the same detector, so total request volume stays where
+  // it was.
+  var TURBO_LEAD_MS = 25000;   // start before midnight
+  var TURBO_TAIL_MS = 60000;   // keep going after it
+  var TURBO_POKE_MS = 600;     // how often to make the app refetch
+  var TURBO_REPLAY_MS = 600;   // radar cadence while turbo is poking
+  function inTurboWindow() {
+    var d = msToRollover();
+    return d <= TURBO_LEAD_MS && d >= -TURBO_TAIL_MS;
+  }
+  // UI mode: waits around the page's own Book click. Measured live: the page
+  // can take 6-24s to mint its reCAPTCHA token and send, far longer than the
+  // ~1s a warm profile needs. Both windows are upper bounds — the normal case
+  // resolves in well under a second — and a window that expires early
+  // misreports a booking that actually succeeded.
+  var SEND_WAIT_MS = 12000;
+  var OUTCOME_WAIT_MS = 35000;
+  // Direct mode from here on.
   // One thread for everything: a click runs Google's handlers (and possibly a
   // grid re-render) synchronously on the thread the shot needs, so parking and
   // refetching stand still this close to the rollover.
@@ -626,6 +837,21 @@
   // the page mints its own reCAPTCHA token), swallow it before it reaches the
   // network, rewrite the slot epochs to the target, and fire it at corrected
   // midnight — the booking arrives one RTT after the rollover.
+  //
+  // Set while a capture has a Book click in flight on a SACRIFICIAL slot. Until
+  // it settles, the swallow in inject.js is the only thing stopping that slot
+  // from being booked for real, so a manual "book now" waits it out rather than
+  // disarming underneath it.
+  var capturePending = null;
+  function settleCapture() {
+    if (capturePending) { capturePending.done(); capturePending = null; }
+  }
+  function markCapturePending() {
+    var resolve;
+    var p = new Promise(function (r) { resolve = r; });
+    capturePending = { promise: p, done: resolve };
+  }
+
   async function prepareDirectBooking(td, job, myGen) {
     try {
       setStatus("Готовлю прямой запрос для " + job.label + "…");
@@ -667,6 +893,7 @@
       var book = bookButton();
       if (!book) { log("direct prep: no Book button"); await closeModal(); return false; }
       var capP = awaitMsg(captureWaiters, 6000);
+      markCapturePending();
       book.click();
       var cap = await capP;
       if ((!cap || !cap.ok) && captchaVisible()) {
@@ -702,6 +929,7 @@
       log("direct prep error", e);
       return false;
     } finally {
+      settleCapture();
       // NEVER leave the hook swallowing bookings — it would eat a real Book
       // click later. The catch path can reach here with the modal still open
       // (setStatus/notify throw synchronously on "extension context
@@ -888,6 +1116,11 @@
       return;
     }
     if (!live(myGen)) return;
+    if (cfg.mode === "ui") {
+      log("booking mode: UI (radar + grab)");
+      return startUiPolling(td, jobs, cfg, myGen);
+    }
+    log("booking mode: direct shot");
     if (shotWindowPassed(td)) { await refuseOpenDate(cfg); return; }
 
     setStatus("Жду полночь " + shotNightLabel(td) + ": прямой запрос на " + jobTimes(jobs) + ", " + cfg.targetDate);
@@ -950,9 +1183,134 @@
     }
   }
 
-  // ---------- booking form (used by the capture) ----------
+  // ---------- UI mode: radar + parker ----------
+  async function startUiPolling(td, jobs, cfg, myGen) {
+    setStatus("Жду открытия " + jobTimes(jobs) + " на " + cfg.targetDate + " (радар " + REPLAY_MS + "мс)…");
+
+    var grabbed = false;
+    // Detection MUST be time-specific: look for the EXACT slot's epoch in the
+    // response. A day-level "date is available" check falsely fires when the
+    // day already has OTHER times open (e.g. 8:30/2:30 exist but 1:00pm doesn't).
+    // With two jobs the whole day opens in one response, so the first hit for
+    // ANY job starts the booking queue for all of them.
+    function tryDetect(bodies) {
+      if (grabbed || !live(myGen)) return false;
+      var hit = jobs.filter(function (j) {
+        return !j.done && bodiesContainTarget(bodies, td, j.timeMin);
+      });
+      if (!hit.length) return false;
+      grabbed = true;
+      onSlotsBody = null;
+      // This body has now been acted on. Leaving it in place would make the
+      // next armed run (after a re-arm) detect instantly from the same stale
+      // evidence and spin grab -> re-arm -> grab.
+      lastAppSlots = { body: "", ts: 0 };
+      log("slot detected in ListAvailableSlots response:", jobTimes(hit));
+      runGrabs(td, jobs, cfg, myGen, hit);
+      return true;
+    }
+    // Event-driven path: every availability response (the app's own or a
+    // replayed one) is checked the moment it arrives, not once per loop turn.
+    onSlotsBody = function (body) { tryDetect([body]); };
+
+    // View parker: anchor the strip so the target's column stays on screen.
+    (async function parker() {
+      var notGrabbed = function () { return !grabbed; };
+      var abortOnGrab = function () { return grabbed || !live(myGen); };
+      await ensureMonth(td); if (!live(myGen) || grabbed) return;
+      await parkView(td); if (!live(myGen) || grabbed) return;
+      // Warm the modal now, while nothing is at stake — see prewarmModal().
+      await prewarmModal(myGen, notGrabbed); if (!live(myGen) || grabbed) return;
+      parkedYmd = 0;                        // the prewarm click moved the view
+      var nextMaint = Date.now() + MAINTENANCE_MS;
+      var turboOn = false;
+      var nextProbe = 0;
+      while (live(myGen) && !grabbed) {
+        // Any dialog left open (prewarm, a stray click) would swallow the
+        // clicks below and the slot click when the moment comes.
+        if (dialogEl()) { await closeModal(); if (!live(myGen) || grabbed) return; }
+        await ensureMonth(td); if (!live(myGen) || grabbed) return;
+        beatOwnership();   // let a second tab see this run is alive
+        // Keep the server-clock estimate fresh; tighter as the rollover nears,
+        // since the turbo window is timed against that estimate.
+        if (Date.now() >= nextProbe) {
+          var near = Math.abs(msToRollover()) < 120000;
+          nextProbe = Date.now() + (near ? 5000 : 60000);
+          toInject("clock-probe");
+        }
+        if (inTurboWindow()) {
+          // Rollover imminent: keep the app fetching so it renders the new day
+          // on its own — no post-detection redraw to wait out.
+          if (!turboOn) {
+            turboOn = true;
+            setStatus("Полночь близко — держу календарь горячим…");
+          }
+          pokeApp(td);
+          await sleep(TURBO_POKE_MS);
+        } else {
+          if (turboOn) {
+            turboOn = false;
+            setStatus("Жду открытия " + jobTimes(jobs) + " на " + cfg.targetDate + "…");
+          }
+          if (maintenanceAsap || Date.now() >= nextMaint) {
+            maintenanceAsap = false;
+            nextMaint = Date.now() + MAINTENANCE_MS;
+            await forceRefetch(td, abortOnGrab);
+          } else {
+            await parkView(td);
+          }
+          await sleep(1000);
+        }
+      }
+    })();
+
+    // Replay radar: ask the server directly, no DOM involved.
+    var fails = 0;
+    var beat = { n: 0, ok: 0, since: Date.now(), lastStatus: 0 };
+    while (live(myGen) && !grabbed) {
+      var t0 = Date.now();
+      var rep = await replayOnce(2000);
+      if (!live(myGen) || grabbed) return;
+      // Detection BEFORE logging: a log line costs a few µs of the thread and
+      // this is the path that decides the race.
+      if (tryDetect([rep && rep.body, lastAppSlots.body])) return;
+      // Radar runs ~3x/s for hours, so per-request logging is a heartbeat
+      // outside the rollover window and full detail inside it, where every
+      // response is worth seeing. Reaching here means tryDetect found no
+      // target, so the presence check needs no second scan.
+      beat.n++;
+      beat.lastStatus = (rep && rep.status) || 0;
+      if (beat.lastStatus === 200) beat.ok++;
+      if (inTurboWindow()) {
+        log("radar replay: status " + beat.lastStatus + ", " + ((rep && rep.body) || "").length +
+            "b, target absent, " + (Date.now() - t0) + "ms");
+      } else if (Date.now() - beat.since >= 10000) {
+        log("radar heartbeat: " + beat.ok + "/" + beat.n + " ok in " +
+            ((Date.now() - beat.since) / 1000).toFixed(0) + "s, midnight in " +
+            (msToRollover() / 1000).toFixed(0) + "s");
+        beat = { n: 0, ok: 0, since: Date.now(), lastStatus: beat.lastStatus };
+      }
+      if (rep && rep.status === 200) {
+        fails = 0;
+      } else if (++fails >= 6) {
+        // ~2s of dead replays: template missing or credentials stale — have
+        // the parker force an app fetch right away to re-capture it.
+        fails = 0;
+        maintenanceAsap = true;
+        setStatus("Радар без ответа — обновляю шаблон запроса…", "warn");
+      }
+      // While turbo pokes the app, its own responses hit the same detector, so
+      // the radar can back off and keep total request volume flat.
+      var wait = (inTurboWindow() ? TURBO_REPLAY_MS : REPLAY_MS) - (Date.now() - t0);
+      if (wait > 0) { await sleep(wait); if (!live(myGen) || grabbed) return; }
+    }
+  }
+
+  // ---------- booking form (used by the capture and the UI grab) ----------
   // The modal header reads e.g. "Wednesday, July 8, 4:00 – 5:30pm". Once ANY
-  // month name is rendered, parseModalDate() can read the sacrificial date.
+  // month name is rendered, parseModalDate() can read the sacrificial date and
+  // the grab can decide target-vs-neighbour immediately instead of waiting out
+  // a fixed grace period.
   function modalDateRendered() {
     var d = dialogEl();
     if (!d) return false;
@@ -979,6 +1337,383 @@
       await sleep(40);
     }
     return did.first && did.mail;
+  }
+
+  // ---------- UI grab (book on the same page, retry through render lag) ----------
+  // Book ONE job through the UI. Returns an outcome string; the caller owns
+  // status/notifications/state so a queue of jobs can be reported as a whole:
+  //   ok | sent | captcha | taken | unrendered | noform | nobutton | probably |
+  //   unconfirmed | aborted
+  async function grabJob(td, job, cfg, myGen, opts) {
+    opts = opts || {};
+    var timeMin = job.timeMin;
+    setStatus("Слот " + job.label + " открылся! Бронирую…", "ok");
+    // Belt & suspenders: never run the real booking through a swallowed hook.
+    toInject("suppress-booking-off");
+
+    // Buttons that already opened a WRONG-day modal. Without this, a same-time
+    // slot on a neighbouring day would be clicked again every iteration
+    // (open modal -> discard -> re-find the same button) until the deadline.
+    // A re-render replaces the elements, so genuinely new buttons still get tried.
+    var tried = [];
+    function freshCandidates() {
+      var c = findSlotButtons(timeMin).filter(function (b) { return tried.indexOf(b) === -1; });
+      return c.length ? c : null;   // null (not []) so waitFor keeps polling
+    }
+    // The modal must match the target day AND this job's time — with two jobs
+    // in play, a leftover modal for the other slot must not be filled in here.
+    function modalIsThisJob() {
+      return modalMatchesTarget(td) && !modalShowsOtherTime(timeMin);
+    }
+
+    var opened = false;
+    var filled = false;
+    // With expectStacked, the dialog on screen belongs to the PREVIOUS job and
+    // is still submitting — leave it alone. Its Cancel is disabled anyway, and
+    // clicking our slot simply stacks a new dialog on top of it.
+    if (dialogEl() && !opts.expectStacked) {
+      if (modalIsThisJob()) {
+        opened = true;
+        setStatus("Заполняю данные…");
+        filled = await fillForm(job.data);
+      } else {
+        await closeModal();
+      }
+      if (!live(myGen)) return "aborted";
+    }
+    var deadline = Date.now() + 15000;
+    while (Date.now() < deadline && !opened) {
+      if (!live(myGen)) return "aborted";
+      // The parked strip already shows the target's column, so the slot button
+      // renders in place — no day selection needed. Check what's on screen, then
+      // give the app a brief moment: the radar usually beats the DOM by ~200ms,
+      // and catching that render saves any nudging at all. In the turbo window
+      // the app is already fetching on its own, so this is the usual path.
+      var cands = freshCandidates() || (await waitFor(freshCandidates, 150, 30)) || [];
+
+      // Not rendered yet — the DOM still holds pre-rollover availability.
+      // Selecting the target day is the shortest way to make the app refetch it:
+      // one click, and the day lands as the strip's first column.
+      //
+      // Deliberately NOT gated on isDateAvailable(): that reads the stale
+      // "no available times" label, while the radar has already confirmed
+      // server-side that the slot is open. Trusting the label here would strand
+      // us at exactly the moment the slot opens.
+      if (!cands.length && live(myGen)) {
+        await ensureMonth(td); if (!live(myGen)) return "aborted";
+        var cell = dateCellButton(ymd(td));
+        if (cell && !cell.disabled && cell.getAttribute("aria-disabled") !== "true") {
+          cell.click();
+          cands = (await waitFor(freshCandidates, 700, 40)) || [];
+        }
+      }
+      if (!cands.length && live(myGen)) {
+        // The cell was disabled, or the app served its cache: force a fetch and
+        // watch for the button WHILE it runs, since the redraw usually lands
+        // during the refetch's own pauses. forceRefetch stops once we're set.
+        var seen = null;
+        var refetching = forceRefetch(td, function () { return !!seen || !live(myGen); })
+          .catch(function (e) { log("refetch failed", e); });
+        seen = await waitFor(freshCandidates, 1200, 40);
+        if (!seen) { await refetching; seen = await waitFor(freshCandidates, 400, 40); }
+        cands = seen || [];
+      }
+      if (!live(myGen)) return "aborted";
+      // Try each same-time button; verify the modal is actually the target day
+      // (the multi-day column view can show the same time on a neighbouring day).
+      for (var i = 0; i < cands.length; i++) {
+        if (!live(myGen)) return "aborted";
+        // Wait for a dialog that was not already on screen. Dialogs stack, so
+        // "is there a dialog" would be satisfied instantly by the previous
+        // job's — and we would then validate and fill the wrong one.
+        var priorDialogs = [].slice.call(document.querySelectorAll('[role="dialog"]'));
+        cands[i].click();
+        // No new dialog means the click hit a detached node (a turbo redraw
+        // landed between the query and the click) — retry fast instead of
+        // sitting out the full modal-open patience below.
+        if (!(await waitFor(function () {
+          var d = dialogEl();
+          return (d && priorDialogs.indexOf(d) === -1) ? d : null;
+        }, 1500, 30))) continue;
+        if (!(await waitFor(modalDateRendered, 2000, 40))) continue;
+        if (!modalIsThisJob()) {          // wrong day/time -> skip this button
+          tried.push(cands[i]);
+          await closeModal();
+          continue;
+        }
+        opened = true;
+        setStatus("Заполняю данные…");
+        log("modal open for " + job.label + " (candidate " + (i + 1) + "/" + cands.length + ")");
+        filled = await fillForm(job.data);  // starts as soon as the first input exists
+        log("form filled=" + filled + " for <" + job.data.email + "> кв." + job.data.flat);
+        break;
+      }
+      if (!opened) await sleep(150);
+    }
+
+    if (!live(myGen)) return "aborted";
+    if (!opened) return "unrendered";
+
+    if (!filled) {              // late-rendering inputs: one more pass
+      filled = await fillForm(job.data);
+      if (!live(myGen)) return "aborted";
+      if (!filled) return "noform";
+    }
+
+    var book = bookButton();
+    if (!book) return "nobutton";
+
+    setStatus("Жму Book…");
+    // These windows are generous on purpose. The page mints its reCAPTCHA token
+    // before sending, which is sub-second on a warm profile but was measured at
+    // 6-24s under heavy bot scrutiny — and a window that expires early turns a
+    // booking that DID succeed into a reported failure.
+    var sentP = opts.handoff ? nextBookingSent(SEND_WAIT_MS) : null;
+    var resultP = nextBookingResult(OUTCOME_WAIT_MS);
+    var clickedAt = Date.now();
+    book.click();
+    log("Book clicked for " + job.label);
+
+    // Fast handoff: stop waiting once the request is provably in flight and let
+    // the queue open the next slot ~1s sooner. Only the SEND is waited for —
+    // never the response — because after the send nothing we do to the DOM can
+    // undo the booking. A captcha challenge still stops everything, and if no
+    // send is observed we fall through to the full wait, so this can never be
+    // slower than not having it.
+    if (sentP) {
+      // The captcha arm must only settle when a challenge is actually visible.
+      // Giving it its own timeout made it resolve null first and win the race,
+      // capping the send wait at the captcha timeout regardless of
+      // SEND_WAIT_MS — observed live, aborting a handoff that would have worked.
+      var s = await Promise.race([
+        sentP.then(function (d) { return d ? { sent: d } : { none: true }; }),
+        untilTrue(captchaVisible, 250).then(function () { return { captcha: true }; })
+      ]);
+      if (!live(myGen)) return "aborted";
+      if (s && s.captcha) return "captcha";
+      if (s && s.sent) {
+        log("handoff: " + job.label + " is in flight after " + (Date.now() - clickedAt) +
+            "ms (seq " + s.sent.seq + ") — queue moves on");
+        opts.handoff(job, bookingResultFor(s.sent.seq, OUTCOME_WAIT_MS));
+        return "sent";
+      }
+      log("handoff: no send seen for " + job.label + " within " + SEND_WAIT_MS +
+          "ms — waiting for the outcome as usual");
+    }
+
+    var outcome = await Promise.race([
+      resultP.then(function (r) { return { kind: "rpc", data: r }; }),
+      waitFor(captchaVisible, OUTCOME_WAIT_MS, 300).then(function (v) { return v ? { kind: "captcha" } : null; }),
+      waitFor(bookingConfirmed, OUTCOME_WAIT_MS, 400).then(function (v) { return v ? { kind: "confirmed" } : null; }),
+      waitFor(slotTakenText, OUTCOME_WAIT_MS, 250).then(function (v) { return v ? { kind: "taken" } : null; })
+    ]);
+    if (!outcome || (outcome.kind === "rpc" && outcome.data && outcome.data.status !== 200)) {
+      if (captchaVisible()) outcome = { kind: "captcha" };
+    }
+
+    var raceMs = Date.now() - clickedAt;
+    log("Book outcome for " + job.label + ": " + ((outcome && outcome.kind) || "nothing") +
+        (outcome && outcome.kind === "rpc" ? " http=" + ((outcome.data && outcome.data.status) || 0) +
+          ((outcome.data && outcome.data.body) ? " body=" + String(outcome.data.body).slice(0, 200) : "") : "") +
+        " after " + (Date.now() - clickedAt) + "ms");
+    if (outcome && outcome.kind === "captcha") return "captcha";
+    if (outcome && outcome.kind === "taken") return "taken";
+    var ok = (outcome && outcome.kind === "confirmed") ||
+             (outcome && outcome.kind === "rpc" && outcome.data && outcome.data.status === 200);
+    if (ok) return "ok";
+    // No verdict in time. Before calling it a failure, ask the server whether
+    // the slot is still bookable — in testing the page sent its request after
+    // our window closed, so a real booking was reported as a failure and its
+    // summary said "0 of 2". A slot that has gone away right after we pressed
+    // Book is most likely ours, but say "probably" rather than claim it.
+    var chk = await replayOnce(3000);
+    if (!live(myGen)) return "aborted";
+    if (chk && chk.body && !bodiesContainTarget([chk.body], td, timeMin)) {
+      log("no verdict in " + raceMs + "ms, but " + job.label + " is no longer bookable — treating as probably booked");
+      return "probably";
+    }
+    return "unconfirmed";
+  }
+
+  // After a booking completes, the page can sit on a confirmation view. Get
+  // back to the slot grid so the next job has something to click.
+  async function backToGrid(myGen) {
+    // Grid buttons behind a modal overlay still pass visible(), so the button
+    // count alone is not proof we are back on the grid — a leftover dialog
+    // would swallow the next job's clicks (or worse, be filled in as if it
+    // were that job's own modal).
+    if (!dialogEl() && slotButtonsAll().length) return true;
+    await closeModal();
+    if (!live(myGen)) return false;
+    if (!dialogEl() && slotButtonsAll().length) return true;
+    clickByText(["Done", "Close", "Book another time", "Listo", "Cerrar", "Готово", "Закрыть"]);
+    var seen = await waitFor(function () {
+      return (!dialogEl() && slotButtonsAll().length) ? true : null;
+    }, 3000, 80);
+    return !!seen;
+  }
+
+  function reportJob(job, out, cfg) {
+    var when = cfg.targetDate + " " + job.time;
+    if (out === "ok") {
+      setStatus("✅ Слот " + job.label + " забронирован!", "ok");
+      notify("✅ Padel забронирован", "Слот " + when + " успешно занят.", true);
+    } else if (out === "captcha") {
+      setStatus("КАПЧА — нужен ты. Открой вкладку и добей вручную", "error");
+      notify("⚠️ Padel: капча!", "Автобронь остановлена. Открой вкладку календаря и реши капчу вручную.", true);
+    } else if (out === "taken") {
+      setStatus("Слот " + job.label + " перехватили раньше нас", "error");
+      notify("Padel: слот перехвачен", "Кто-то успел забронировать " + job.time + " первым.", true);
+    } else if (out === "noform") {
+      setStatus("Поля формы не заполнились — проверь вкладку", "error");
+      notify("Padel: заполни форму", "Слот " + job.time + " открыт, но поля не заполнились. Открой вкладку.", true);
+    } else if (out === "nobutton") {
+      setStatus("Кнопка Book не найдена — стоп", "error");
+      notify("Padel: проверь вкладку", "Кнопка Book не найдена для " + job.time + ".", true);
+    } else if (out === "unrendered") {
+      setStatus("Слот " + job.label + " не отрисовался вовремя", "warn");
+    } else if (out === "probably") {
+      setStatus("Похоже, " + job.label + " забронирован — проверь почту", "warn");
+      notify("Padel: похоже, забронировано", "Слот " + when + " больше не свободен, но подтверждение не пришло. Проверь почту.", true);
+    } else if (out === "unconfirmed") {
+      setStatus("Не удалось подтвердить бронь " + job.label + " — проверь вкладку", "error");
+      notify("Padel: проверь бронь", "Не удалось подтвердить результат для " + job.time + ". Открой вкладку.", true);
+    }
+  }
+
+  // Work the jobs one at a time — there is a single modal in the DOM, so UI
+  // bookings cannot overlap.
+  async function runGrabs(td, jobs, cfg, myGen, detected) {
+    try {
+      await runGrabsInner(td, jobs, cfg, myGen, detected);
+    } catch (e) {
+      // Without this, a throw anywhere in the grab pipeline leaves the state
+      // "armed"/"grab" with no loop running: armed, blind and silent.
+      log("GRAB PIPELINE THREW:", e && e.message ? e.message : String(e), e && e.stack ? e.stack : "");
+      setStatus("Ошибка при бронировании — проверь вкладку", "error");
+      notify("Padel: ошибка", "Бронирование прервано ошибкой. Открой вкладку календаря.", true);
+      try { await setState("idle"); } catch (e2) { /* context gone */ }
+    }
+  }
+
+  async function runGrabsInner(td, jobs, cfg, myGen, detected) {
+    var did = 0;
+    // Work the slots we KNOW are open first. With two jobs, fixed config order
+    // could park us on an unavailable slot for its full 15s deadline — while
+    // thrashing the grid with refetches — before touching the one that just
+    // opened.
+    var queue = jobs.slice().sort(function (a, b) {
+      var ad = detected && detected.indexOf(a) !== -1 ? 0 : 1;
+      var bd = detected && detected.indexOf(b) !== -1 ? 0 : 1;
+      return ad - bd;
+    });
+    log("UI booking queue starts: " + jobTimes(queue) + " on " + cfg.targetDate +
+        (detected && detected.length ? " (detected: " + jobTimes(detected) + ")" : ""));
+
+    // Jobs handed off mid-flight: their result lands after the queue has moved
+    // on, so collect the promises and settle them before reporting totals.
+    var handoffs = [];
+    function handoff(hjob, resultPromise) {
+      handoffs.push(resultPromise.then(function (r) {
+        var ok = !!(r && r.status === 200);
+        hjob.out = ok ? "ok" : "unconfirmed";
+        hjob.ok = ok;
+        log("handoff result for " + hjob.label + ": http=" + ((r && r.status) || "timeout") +
+            ((r && r.body) ? " body=" + String(r.body).slice(0, 160) : ""));
+        reportJob(hjob, hjob.out, cfg);
+      }));
+    }
+
+    var prevHandedOff = false;
+    for (var i = 0; i < queue.length; i++) {
+      var job = queue[i];
+      if (!live(myGen)) return;
+      if (job.done) continue;
+      // Only return to the grid when the previous job actually finished. After
+      // a handoff its dialog is deliberately left open and ours stacks on top.
+      var stacked = prevHandedOff;
+      if (did > 0 && !prevHandedOff && !(await backToGrid(myGen))) {
+        if (!live(myGen)) return;
+        // A dialog we could not dismiss is NOT a reason to abandon this slot:
+        // its Cancel is simply disabled while the previous booking submits, and
+        // clicking our slot stacks a fresh dialog on top of it regardless.
+        // Giving up here lost a bookable slot in testing.
+        log("could not dismiss the previous dialog before " + job.label + " — stacking on top of it instead");
+        stacked = true;
+      }
+      // Hand off every job except the last: there is nothing left to overlap
+      // with after it, so the last one waits and reports normally.
+      var isLast = (i === queue.length - 1);
+      var out = await grabJob(td, job, cfg, myGen, {
+        handoff: isLast ? null : handoff,
+        expectStacked: stacked
+      });
+      if (!live(myGen) || out === "aborted") return;
+      did++;
+      prevHandedOff = (out === "sent");
+      if (out === "sent") { job.done = true; continue; }   // reported by its handoff
+      job.done = true;
+      job.out = out;
+      job.ok = (out === "ok" || out === "probably");
+      reportJob(job, out, cfg);
+      // A captcha challenge or a half-filled form blocks everything behind it.
+      if (out === "captcha" || out === "noform" || out === "nobutton") {
+        log("queue stops after " + job.label + " (" + out + ") — needs a human");
+        break;
+      }
+    }
+    if (!live(myGen)) return;
+    if (handoffs.length) {
+      log("waiting for " + handoffs.length + " handed-off booking(s) to report");
+      await Promise.all(handoffs);
+      if (!live(myGen)) return;
+    }
+    var okJobs = jobs.filter(function (j) { return j.ok; });
+    if (jobs.length > 1) {
+      setStatus(okJobs.length === jobs.length
+        ? "✅ Забронировано: " + jobTimes(okJobs)
+        : "Забронировано " + okJobs.length + " из " + jobs.length + " (" + (jobTimes(okJobs) || "—") + ")",
+        okJobs.length === jobs.length ? "ok" : "warn");
+    }
+    // Re-arm when nothing was booked and at least one slot merely failed to
+    // render — that slot may still open, so keep waiting. This is decided
+    // PER JOB: previously one job's conclusive loss ("taken") cancelled the
+    // re-arm the other job still needed, abandoning an open slot.
+    // Never re-arm after any success: jobs are rebuilt from cfg on re-entry,
+    // which would lose their state and book the same slot twice.
+    var anyUnrendered = jobs.some(function (j) { return j.out === "unrendered"; });
+    if (!okJobs.length && anyUnrendered && live(myGen) &&
+        (await get([STATE_KEY]))[STATE_KEY] === "armed") {
+      setStatus("Слот не отрисовался вовремя — продолжаю ждать", "warn");
+      startPolling(myGen);
+      return;
+    }
+    // Disarming with something still unbooked is worth saying out loud — the
+    // summary status alone is easy to miss at 00:00.
+    var missed = jobs.filter(function (j) { return !j.ok; });
+    if (missed.length && okJobs.length) {
+      notify("Padel: часть слотов не занята",
+        "Не забронировано: " + missed.map(function (j) { return j.time; }).join(", ") + ". Проверь вкладку.", true);
+    }
+    await setState("idle");
+  }
+
+  async function grabNow(myGen) {
+    // A capture may have just clicked Book on a sacrificial slot; grabJob would
+    // disarm the swallow and let that request through, booking a slot nobody
+    // asked for. It settles in ~6s at the worst, and this is a manual action.
+    if (capturePending) {
+      log("book-now waiting for an in-flight capture to settle first");
+      await Promise.race([capturePending.promise, sleep(7000)]);
+      if (!live(myGen)) return;
+    }
+    var st = await get([CFG_KEY]);
+    if (!live(myGen)) return;
+    var cfg = st[CFG_KEY] || {};
+    var td = parseTargetDate(cfg.targetDate);
+    var jobs = buildJobs(cfg);
+    if (!td || !jobs.length) { setStatus("Заполни дату и время в popup", "error"); await setState("idle"); return; }
+    await runGrabs(td, jobs, cfg, myGen);
   }
 
   // ---------- lifecycle ----------
@@ -1013,13 +1748,14 @@
     if (changes[CFG_KEY] && !changes[STATE_KEY]) { scheduleCfgRestart(); return; }
     if (!changes[STATE_KEY]) return;
     var s = changes[STATE_KEY].newValue;
-    runGen++;                    // bump => a running loop bails at once
+    runGen++;                    // bump => any running poll/grab loop bails at once
     log("state changed ->", s, "(runGen " + runGen + ")");
     // inject owns the fire timer, so it cannot see runGen. Any state change
     // invalidates a pending shot — without this, "Выключить" at 23:59:58 would
     // still book at midnight. startPolling re-arms it when appropriate.
     toInject("cancel-fire");
     if (s === "armed") startPolling(runGen);
+    else if (s === "grab") grabNow(runGen);
     // idle: nothing to start; the runGen bump already halted the loop.
   });
 
@@ -1031,9 +1767,16 @@
     log("boot, state =", s);
     runGen++;
     if (s === "armed") startPolling(runGen);
-    else if (s !== "idle") {
-      // Only idle/armed exist now. A leftover from an older version (the
-      // retired "grab") must not sit there looking like a run in progress.
+    else if (s === "grab") {
+      // "grab" is a momentary command, never a state to resume. Booking is
+      // driven on the already-open tab, so a "grab" seen at page load is a
+      // leftover from a tab closed mid-booking — resuming it would book
+      // automatically on any future visit to the calendar.
+      log("stale 'grab' state at load — clearing it instead of booking");
+      await setState("idle");
+    } else if (s !== "idle") {
+      // Only idle/armed/grab exist. Anything else must not sit there looking
+      // like a run in progress.
       log("unknown state '" + s + "' at load — clearing it");
       await setState("idle");
     }

@@ -20,6 +20,14 @@
   </div>
 
   <form id="cfg">
+    <div class="mode">Способ брони
+      <div class="seg" role="radiogroup" aria-label="Способ брони">
+        <label><input type="radio" name="mode" value="direct" checked /><span>⚡ Прямой запрос</span></label>
+        <label><input type="radio" name="mode" value="ui" /><span>🖱 Через интерфейс</span></label>
+      </div>
+      <div id="modeHint" class="hint mode-hint"></div>
+    </div>
+
     <label>Дата <span class="hint">— общая для обеих броней</span>
       <div class="row three">
         <select id="dd" aria-label="День"></select>
@@ -98,6 +106,10 @@
 
   <div class="toggle-wrap">
     <button id="toggle" class="toggle off" type="button">Включить ожидание</button>
+  </div>
+
+  <div id="bookNowRow" class="row" hidden>
+    <button id="bookNow" class="secondary" type="button">Забронировать сейчас</button>
   </div>
 
   <div id="status" class="status">Выключено</div>

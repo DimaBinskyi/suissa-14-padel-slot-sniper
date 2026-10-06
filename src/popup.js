@@ -52,6 +52,27 @@ function defaultDate() {
   return { y: String(t.getFullYear()), mo: pad(t.getMonth() + 1), d: pad(t.getDate()) };
 }
 
+// ---- booking mode: "direct" (pre-captured request at midnight) or "ui" ----
+// A cfg without a mode (saved before the switch existed) is a direct one.
+var MODE_HINT = {
+  direct: "Запрос собирается за ~20 с до полуночи и уходит в момент открытия даты. Стреляет только в полночь открытия.",
+  ui: "Радар ждёт появления слота и бронирует через форму на странице — в полночь или когда слот освободится."
+};
+function readMode() {
+  var r = document.querySelector('input[name="mode"]:checked');
+  return r && r.value === "ui" ? "ui" : "direct";
+}
+function writeMode(mode) {
+  var want = mode === "ui" ? "ui" : "direct";
+  document.querySelectorAll('input[name="mode"]').forEach(function (r) { r.checked = (r.value === want); });
+}
+function applyModeVisibility() {
+  var mode = readMode();
+  el("modeHint").textContent = MODE_HINT[mode];
+  // "Book now" is a UI booking, so it only belongs to the UI mode.
+  el("bookNowRow").hidden = mode !== "ui";
+}
+
 // ---- profiles: named sets of booking data (Имя/Фамилия/email/квартира) ----
 // The active profile's values are mirrored into cfg on every edit/switch, so
 // the content script keeps reading cfg exactly as before.
@@ -171,6 +192,7 @@ function onInfoEdit() {
 function readForm() {
   var cfg = {};
   cfg.calendarUrl = DEFAULT_URL; // fixed, not user-editable
+  cfg.mode = readMode();
   cfg.targetDate = readDate();
   cfg.targetTime = el("targetTime").value;
   INFO.forEach(function (id) { cfg[id] = el(id).value; });
@@ -189,12 +211,12 @@ function applyStatus(status, state) {
   var e = el("status");
   e.className = "status " + (status && status.level ? status.level : "");
   if (state === "idle" && !status) { e.textContent = "Выключено"; return; }
-  e.textContent = status ? status.text : (state === "armed" ? "Ожидание…" : "Выключено");
+  e.textContent = status ? status.text : (state === "armed" ? "Ожидание…" : state === "grab" ? "Бронирую…" : "Выключено");
 }
 
 function applyToggle(state) {
   var btn = el("toggle");
-  var on = state === "armed";
+  var on = (state === "armed" || state === "grab");
   btn.className = "toggle " + (on ? "on" : "off");
   btn.textContent = on ? "Выключить" : "Включить ожидание";
 }
@@ -218,6 +240,8 @@ async function restore() {
   var cfg = st.cfg || {};
   renderEngine(st.engine);
   el("calendarUrl").value = DEFAULT_URL;
+  writeMode(cfg.mode);
+  applyModeVisibility();
   writeDate(cfg.targetDate);
   if (cfg.targetTime) el("targetTime").value = cfg.targetTime;
 
@@ -244,8 +268,8 @@ async function restore() {
   if (migrated) await saveProfiles();
   // cfg stays the booking source of truth — re-sync it if it diverged.
   var ap = activeProfile();
-  // Also drops the retired UI-booking setting (autoBook) — but never while
-  // armed, where a cfg write restarts the run.
+  // Also drops the retired autoBook setting (the UI mode always presses Book)
+  // — but never while armed, where a cfg write restarts the run.
   var legacy = ("autoBook" in cfg) && st.state !== "armed";
   if (legacy || INFO.some(function (id) { return (cfg[id] || "") !== (ap[id] || ""); })) await saveCfg();
   chrome.storage.local.remove("armedOffAfterBook");   // retired UI-booking flag
@@ -259,7 +283,7 @@ async function restore() {
 
 async function saveCfg() {
   var cfg = readForm();
-  log("cfg saved:", "date=" + cfg.targetDate, "slot1=" + cfg.targetTime + " <" + cfg.email + "> кв." + cfg.flat,
+  log("cfg saved:", "mode=" + cfg.mode, "date=" + cfg.targetDate, "slot1=" + cfg.targetTime + " <" + cfg.email + "> кв." + cfg.flat,
       cfg.second ? "slot2=" + cfg.second.time + " <" + cfg.second.email + "> кв." + cfg.second.flat : "slot2=off");
   await set({ cfg: cfg });
 }
@@ -286,7 +310,8 @@ function confirmIfSameIdentity(cfg) {
 
 async function toggle() {
   var st = await get(["state"]);
-  if (st.state === "armed") {
+  var on = (st.state === "armed" || st.state === "grab");
+  if (on) {
     log("DISARM requested (state was " + st.state + ")");
     await set({ state: "idle", status: { text: "Выключено", level: "info" } });
   } else {
@@ -294,9 +319,25 @@ async function toggle() {
     var bad = cfgProblem(cfg);
     if (bad) { log("ARM rejected:", bad); alert(bad); return; }
     if (!confirmIfSameIdentity(cfg)) { log("ARM cancelled at the same-identity confirmation"); return; }
-    log("ARM requested:", cfg.targetDate, cfg.targetTime + (cfg.second ? " + " + cfg.second.time : ""));
+    log("ARM requested (" + cfg.mode + "):", cfg.targetDate, cfg.targetTime + (cfg.second ? " + " + cfg.second.time : ""));
     await set({ cfg: cfg, state: "armed", status: { text: "Ожидание слота…", level: "info" } });
   }
+}
+
+async function bookNow() {
+  var cfg = readForm();
+  var problem = cfgProblem(cfg);
+  if (problem) { log("bookNow rejected:", problem); alert(problem); return; }
+  log("BOOK NOW requested:", cfg.targetDate, cfg.targetTime + (cfg.second ? " + " + cfg.second.time : ""));
+  // Fast mode: no reload. The content script grabs on the already-open tab.
+  await set({ cfg: cfg, state: "grab", status: { text: "Бронирую…", level: "info" } });
+  chrome.tabs.query({ url: "https://calendar.google.com/calendar/*/appointments/schedules/*" }, function (tabs) {
+    if (tabs && tabs[0]) {
+      chrome.tabs.update(tabs[0].id, { active: true });
+      if (tabs[0].windowId != null) chrome.windows.update(tabs[0].windowId, { focused: true });
+    }
+    window.close();
+  });
 }
 
 function openCalendar() {
@@ -323,6 +364,13 @@ function init() {
     applySecondVisibility();
     saveCfg();
   });
+  document.querySelectorAll('input[name="mode"]').forEach(function (r) {
+    r.addEventListener("change", function () {
+      log("booking mode -> " + readMode());
+      applyModeVisibility();
+      saveCfg();
+    });
+  });
   el("secondProfile").addEventListener("change", renderSecondPreview);
   INFO.forEach(function (id) {
     el(id).addEventListener("input", onInfoEdit);
@@ -333,6 +381,7 @@ function init() {
   el("profileDel").addEventListener("click", deleteProfile);
   el("openCal").addEventListener("click", openCalendar);
   el("toggle").addEventListener("click", toggle);
+  el("bookNow").addEventListener("click", bookNow);
 }
 
 // Run now if the DOM is already parsed, otherwise wait for it.
