@@ -300,15 +300,28 @@
     } else if (d.cmd === "clock-probe") {
       // A same-origin request whose only purpose is a READABLE Date header, so
       // the rollover is scheduled on Google's clock instead of this machine's.
-      var pSent = Date.now();
-      (origFetch || fetch).call(window, location.origin + "/favicon.ico", { method: "GET", cache: "no-store" })
-        .then(function (r) {
-          var dh2 = null;
-          try { dh2 = r.headers.get("date"); } catch (e3) { dh2 = null; }
-          post({ type: "clock-sample", dateHeader: dh2, tSent: pSent, tRecv: Date.now(), status: r.status });
-        }).catch(function (err) {
-          post({ type: "clock-sample", dateHeader: null, tSent: pSent, tRecv: Date.now(), error: String(err) });
-        });
+      //
+      // With `burstMs`, keep probing back to back until it runs out: each
+      // request leaves the moment the previous answer lands, so the samples sit
+      // one RTT apart and walk across the server's second tick — the samples
+      // that pin the offset down. Chained on the network rather than on timers,
+      // because a background tab rounds timers to whole seconds and would send
+      // every probe at the same sub-second phase.
+      var burstUntil = Date.now() + (+d.burstMs || 0);
+      (function probe() {
+        var pSent = Date.now();
+        (origFetch || fetch).call(window, location.origin + "/favicon.ico", { method: "GET", cache: "no-store" })
+          .then(function (r) {
+            var dh2 = null;
+            try { dh2 = r.headers.get("date"); } catch (e3) { dh2 = null; }
+            post({ type: "clock-sample", dateHeader: dh2, tSent: pSent, tRecv: Date.now(), status: r.status });
+            // Only the headers were wanted.
+            try { if (r.body) r.body.cancel().catch(function () {}); } catch (e4) { /* nothing to free */ }
+            if (dh2 && Date.now() < burstUntil) probe();
+          }).catch(function (err) {
+            post({ type: "clock-sample", dateHeader: null, tSent: pSent, tRecv: Date.now(), error: String(err) });
+          });
+      })();
     } else if (d.cmd === "suppress-booking-on") {
       suppress = { needle: d.needle || "", until: Date.now() + 20000 };
       // Each capture must be fresh — the reCAPTCHA token inside is short-lived

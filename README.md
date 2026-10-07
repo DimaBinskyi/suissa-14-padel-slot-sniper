@@ -56,8 +56,12 @@ While armed:
    - **Waiting** — keep an open day parked in view (the capture needs a slot
      button on screen) and force one app fetch every ~35 s so the replay
      template's time-bound credentials stay fresh.
-   - **Clock sync** — `Date` headers from a same-origin probe give an NTP-style
-     `server − local` offset; midnight is scheduled on that estimate.
+   - **Clock sync** — each same-origin `Date` header (whole seconds) bounds the
+     `server − local` offset to `[s − tRecv, s + 1000 − tSent]`; the estimate is
+     the middle of the range most samples agree on (Marzullo). In the last 2 min
+     the probes go out in ~1.2 s back-to-back bursts every 15 s, so the samples
+     sweep the second and the range closes to about one RTT (±~45 ms live).
+     Midnight is scheduled on that estimate, not on the Mac's clock.
    - **Capture (T−20 s, +12 s per extra slot)** — open the booking modal on any
      *currently open* (sacrificial) slot, fill the real data, and click **Book**
      while the hook **swallows** the outgoing request. We keep the complete
@@ -67,8 +71,10 @@ While armed:
    - **Retarget** — the sacrificial slot's epochs (ms and seconds forms,
      digit-boundary-safe, single pass) and `YYYYMMDD` are rewritten to the
      target. Any sacrificial id left in the body aborts that shot.
-   - **Fire (corrected midnight + 120 ms)** — all prepared requests leave in the
-     same tick.
+   - **Fire (corrected midnight + the clock's ± bound + 15 ms, at most 120 ms)** —
+     all prepared requests leave in the same tick. The wait is the smallest one
+     that can't be early even in the worst case inside the bound (~40–60 ms on a
+     normal night); 120 ms with no clock samples.
    - **Report** — a 200 counts as a win only once an availability replay shows
      the slot gone. Each slot's verdict, HTTP status, send time and the server's
      answer go to the popup status, a notification, and `lastShot` in storage.
@@ -139,7 +145,7 @@ Requires Chrome 111+ (uses `content_scripts` `world: "MAIN"`).
 **After an update:** reload the extension, then **reload the calendar tab** — an
 open tab keeps running the engine it was loaded with. The popup shows the
 extension version next to its title and, underneath, the version the calendar
-tab is running (`Вкладка календаря: v0.5.0 ✓`). If they differ, reload the tab.
+tab is running (`Вкладка календаря: v0.5.1 ✓`). If they differ, reload the tab.
 
 ## Use
 
@@ -154,8 +160,9 @@ tab is running (`Вкладка календаря: v0.5.0 ✓`). If they differ
    UI mode: a notification per slot (`✅ Слот 20:30 (Pavlo) забронирован!`,
    `перехватили раньше нас`, `КАПЧА — нужен ты…`) and a summary for two slots.
 
-`отправлен T+…` is measured against midnight on **this Mac's** clock (NTP-synced),
-not the corrected estimate — it is the number to compare across nights.
+`отправлен T+…` is measured against midnight on **this Mac's** clock, not the
+corrected estimate. The Mac's clock is itself off by up to ~0.1 s (sntp measured
+it 59–109 ms slow on 2026-10-08), so compare it together with `clockOffsetMs`.
 
 ## One thread (why the fire path looks the way it does)
 
@@ -192,7 +199,8 @@ sent (a stale token merely gets rejected) unless it is past the reCAPTCHA TTL
 The outcome of every shot is persisted, so it survives the tab closing:
 
 - `status` — what the popup shows (the per-slot report after a shot).
-- `lastShot` — `{ fireT, clockOffsetMs, clockSamples, verified, jobs: [{ verdict,
+- `lastShot` — `{ fireT, clockOffsetMs, clockSpreadMs (± bound), clockAgree, sendDelayMs,
+  clockSamples, verified, jobs: [{ verdict,
   http, sentT, ms, body }] }`. Verdicts: `won`, `taken`, `rejected-open` (the slot
   is still free — book it by hand), `200-unverified`, `200-still-open`,
   `failed`, `unprepared`.
@@ -209,7 +217,7 @@ the court's midnight (`T-12.345s` / `T+0.150s`).
 | `[padel popup …]` | popup (right-click the popup → Inspect) |
 | `[padel bg …]` | notifications (`chrome://extensions` → *service worker*) |
 
-Key lines on a live night: `engine v0.5.0 loaded`, `booking mode: …`,
+Key lines on a live night: `engine v0.5.1 loaded`, `booking mode: …`,
 `clock sync: server offset …`, then in direct mode `booking request CAPTURED`,
 `prepare-direct[a]: OK, replacements per pattern = …`, `arm-fire: [a,b] in …ms`,
 `fire[a] <- 200 in 74ms`, and

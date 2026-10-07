@@ -288,12 +288,28 @@
     return (86400 - secs) * 1000;
   }
   // ---------- server clock sync ----------
-  // The rollover happens on GOOGLE's clock, not this machine's. Every replayed
-  // availability response carries a Date header; an NTP-style estimate against
-  // the request's midpoint (header second + 500ms to undo truncation) gives
-  // offset = serverNow - localNow, good to a few hundred ms — enough to
-  // SCHEDULE the midnight shot instead of discovering the rollover by polling.
-  var clockOffsets = [];
+  // The rollover happens on GOOGLE's clock, not this machine's, and this Mac's
+  // clock is NOT a safe stand-in: sntp measured it 109ms slow just after the
+  // 2026-10-08 shot and 59ms slow ten minutes later.
+  //
+  // A Date header only has whole seconds, but it still bounds the offset: the
+  // server stamped second s at some instant inside the request, so
+  //   offset = serverNow - localNow  lies in  [s - tRecv, s + 1000 - tSent].
+  // Each sample is that interval; the estimate is the middle of the range the
+  // most samples agree on (Marzullo's algorithm, so a stray sample cannot drag
+  // it). Samples spread across the second close the range to about one RTT —
+  // checked live against sntp: +59ms ±45 vs sntp's +59ms.
+  //
+  // It used to be the median of (s + 500 - request midpoint). The probes went
+  // out every 5s from a loop ticking on whole seconds, so all 15 samples had
+  // the same sub-second phase and the median was ONE random draw within
+  // ±500ms. On 2026-10-08 it read -209ms while the server was really ~100ms
+  // AHEAD: the shot left ~0.44s after the rollover and the slot was gone.
+  var clockOffsets = [];          // { lo, hi, t } per sample
+  var CLOCK_WINDOW_MS = 180000;   // the Mac's clock slews; old samples go stale
+  var CLOCK_MAX_SAMPLES = 240;
+  var CLOCK_BURST_MS = 1200;      // > 1s, so every burst straddles a server tick
+  var clockFix = { off: 0, lo: 0, hi: 0, agree: 0 };
   var lastLoggedOffset = null;
   var clockProbeWarned = false;
   function noteClockSample(dateHeader, tSent, tRecv) {
@@ -301,21 +317,38 @@
     if (!s || !tSent || !tRecv) return;
     var rtt = tRecv - tSent;
     if (rtt < 0 || rtt > 2000) return; // stalled request — poisoned sample
-    clockOffsets.push((s + 500) - (tSent + tRecv) / 2);
-    if (clockOffsets.length > 15) clockOffsets.shift();
-    // Log the first fix and any material drift; a per-sample log would be 3/s.
-    var off = clockOffset();
-    if (lastLoggedOffset === null || Math.abs(off - lastLoggedOffset) > 150) {
+    clockOffsets.push({ lo: s - tRecv, hi: s + 1000 - tSent, t: tRecv });
+    while (clockOffsets.length > CLOCK_MAX_SAMPLES || tRecv - clockOffsets[0].t > CLOCK_WINDOW_MS) clockOffsets.shift();
+    clockFix = marzullo(clockOffsets);
+    // Log the first fix and any material drift; a per-sample log would be ~20/s
+    // during a burst.
+    var off = clockFix.off;
+    if (lastLoggedOffset === null || Math.abs(off - lastLoggedOffset) > 50) {
       lastLoggedOffset = off;
       log("clock sync: server offset " + (off >= 0 ? "+" : "") + Math.round(off) + "ms" +
-          " (rtt " + rtt + "ms, " + clockOffsets.length + " samples), midnight in " +
+          " ±" + Math.round((clockFix.hi - clockFix.lo) / 2) + "ms (" + clockFix.agree + "/" +
+          clockOffsets.length + " samples agree, rtt " + rtt + "ms), midnight in " +
           (msToRollover() / 1000).toFixed(1) + "s");
     }
   }
+  // The offset range covered by the most sample intervals, and its middle.
+  function marzullo(samples) {
+    var ev = [];
+    samples.forEach(function (c) { ev.push([c.lo, -1], [c.hi, 1]); });
+    // At a shared point, open before close: touching intervals agree.
+    ev.sort(function (a, b) { return a[0] - b[0] || a[1] - b[1]; });
+    var best = 0, n = 0, lo = 0, hi = 0;
+    for (var i = 0; i < ev.length; i++) {
+      if (ev[i][1] < 0) {
+        if (++n > best) { best = n; lo = ev[i][0]; hi = ev[i + 1][0]; }
+      } else {
+        n--;
+      }
+    }
+    return { off: (lo + hi) / 2, lo: lo, hi: hi, agree: best };
+  }
   function clockOffset() {
-    if (!clockOffsets.length) return 0;
-    var a = clockOffsets.slice().sort(function (x, y) { return x - y; });
-    return a[Math.floor(a.length / 2)];
+    return clockOffsets.length ? clockFix.off : 0;
   }
   // msUntilCourtMidnight truncates to the second; add the local sub-second part
   // back (tz offsets are whole minutes, so second boundaries coincide) and
@@ -826,10 +859,18 @@
   var CAPTURE_ABORT_MS = 1800;
   // How far past the rollover a prepared shot is still worth firing.
   var FIRE_LATE_GRACE_MS = 60000;
-  // Fire this long after corrected midnight (cushion for residual clock
-  // error — too early and the server rejects it AND the single-use token is
-  // spent).
+  // Fire this long after corrected midnight: the clock estimate's ± bound
+  // plus a margin, so even the worst case inside the bound is not early — too
+  // early and the server rejects it AND the single-use token is spent. The
+  // margin covers the Mac's clock slewing across the sample window. Capped at
+  // the fixed 120ms used before the estimate had a bound, which is also the
+  // fallback with no clock samples at all.
   var DIRECT_SEND_DELAY_MS = 120;
+  var DIRECT_SEND_MARGIN_MS = 15;
+  function directSendDelayMs(spread) {
+    if (!clockOffsets.length) return DIRECT_SEND_DELAY_MS;
+    return Math.min(DIRECT_SEND_DELAY_MS, spread + DIRECT_SEND_MARGIN_MS);
+  }
 
   // ---------- direct shot ----------
   // Shortly before midnight we let the page build a COMPLETE booking request
@@ -976,16 +1017,18 @@
     var midnightAt = Date.now() + msToRollover();   // corrected midnight on the local clock
     // Math.max: if the rollover already passed, fire now rather than at a
     // deadline in the past.
-    var fireAt = Math.max(Date.now(), midnightAt) + DIRECT_SEND_DELAY_MS;
     var offset = Math.round(clockOffset());
+    var spread = Math.round((clockFix.hi - clockFix.lo) / 2); // ± bound on that offset
+    var sendDelay = directSendDelayMs(spread);
+    var fireAt = Math.max(Date.now(), midnightAt) + sendDelay;
     // Send times are reported against midnight on THIS machine's clock, not
-    // the corrected one: against the estimate every shot reads ~T+0.120s by
+    // the corrected one: against the estimate every shot reads ~T+sendDelay by
     // construction, which hides exactly the error worth seeing — the Date-
     // header estimate itself drifts by 100ms+ from night to night.
     var wallMidnightAt = midnightAt + offset;
     log("midnight fire scheduled in " + (fireAt - Date.now()) + "ms " +
-        "(clock offset " + offset + "ms from " + clockOffsets.length + " samples, send delay " +
-        DIRECT_SEND_DELAY_MS + "ms), armed jobs: " + jobTimes(armed));
+        "(clock offset " + offset + "ms ±" + spread + "ms, " + clockFix.agree + "/" + clockOffsets.length + " samples agree, send delay " +
+        sendDelay + "ms), armed jobs: " + jobTimes(armed));
 
     // Result waiters first, then arm: the reply can arrive one RTT after the
     // deadline, which may be sooner than this function is resumed.
@@ -1069,6 +1112,7 @@
       ts: Date.now(), version: VERSION, date: cfg.targetDate,
       wallMidnightAt: wallMidnightAt, midnightAt: midnightAt, fireAt: fireAt,
       fireT: fireAt - wallMidnightAt, clockOffsetMs: offset, clockSamples: clockOffsets.length,
+      clockSpreadMs: spread, clockAgree: clockFix.agree, sendDelayMs: sendDelay,
       verified: verified, jobs: report
     } });
     notify(won === jobs.length ? "✅ Padel забронирован" : "Padel: результат выстрела", lines.join("\n"), true);
@@ -1135,11 +1179,13 @@
       // Armed across a rollover without firing (e.g. the tab was asleep).
       if (shotWindowPassed(td)) { await refuseOpenDate(cfg); return; }
       beatOwnership();   // let a second tab see this run is alive
-      // Keep the server-clock estimate fresh; tighter as the rollover nears,
-      // since that estimate is what the whole shot is scheduled against.
+      // Keep the server-clock estimate fresh; near the rollover, in bursts
+      // that sweep the second, since that estimate is what the whole shot is
+      // scheduled against.
       if (Date.now() >= nextProbe) {
-        nextProbe = Date.now() + (Math.abs(leftMs) < 120000 ? 5000 : 60000);
-        toInject("clock-probe");
+        var nearProbe = Math.abs(leftMs) < 120000;
+        nextProbe = Date.now() + (nearProbe ? 15000 : 60000);
+        toInject({ cmd: "clock-probe", burstMs: nearProbe ? CLOCK_BURST_MS : 0 });
       }
       // Upkeep comes first so a capture (or its retry) starts from a parked
       // view with an open slot on screen — and none of it near the rollover.
@@ -1231,12 +1277,13 @@
         if (dialogEl()) { await closeModal(); if (!live(myGen) || grabbed) return; }
         await ensureMonth(td); if (!live(myGen) || grabbed) return;
         beatOwnership();   // let a second tab see this run is alive
-        // Keep the server-clock estimate fresh; tighter as the rollover nears,
-        // since the turbo window is timed against that estimate.
+        // Keep the server-clock estimate fresh; near the rollover, in bursts
+        // that sweep the second, since the turbo window is timed against that
+        // estimate.
         if (Date.now() >= nextProbe) {
           var near = Math.abs(msToRollover()) < 120000;
-          nextProbe = Date.now() + (near ? 5000 : 60000);
-          toInject("clock-probe");
+          nextProbe = Date.now() + (near ? 15000 : 60000);
+          toInject({ cmd: "clock-probe", burstMs: near ? CLOCK_BURST_MS : 0 });
         }
         if (inTurboWindow()) {
           // Rollover imminent: keep the app fetching so it renders the new day
