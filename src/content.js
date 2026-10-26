@@ -23,14 +23,15 @@
 //   armed, mode "direct" -> wait for the midnight rollover that opens the
 //            target date, then:
 //            * ~30s before server-corrected midnight, capture the page's own
-//              booking request per job: fill the form on a SACRIFICIAL open
-//              slot, click Book, and let inject.js swallow the request before
-//              it reaches the network. It carries the reCAPTCHA token the page
-//              just minted; its slot epochs are rewritten to the target;
-//            * fire every prepared request ~120ms after corrected midnight from
-//              inject.js's own timer — the booking lands one RTT after the
-//              rollover;
-//            * read each shot's HTTP result, check availability to confirm it,
+//              booking request three times per job (one per shot): fill the
+//              form on a SACRIFICIAL open slot, click Book, and let inject.js
+//              swallow the request before it reaches the network. It carries
+//              the reCAPTCHA token the page just minted; its slot epochs are
+//              rewritten to the target;
+//            * fire the salvo from inject.js's own timers: two shots just
+//              before corrected midnight, the safe one just after it;
+//            * keep a race log of the availability list around the rollover,
+//              read every shot's HTTP result, check availability to confirm,
 //              persist the outcome (status + lastShot) and disarm.
 //            Until then the tab only keeps an open day parked in view (the
 //            capture needs a slot button on screen) and refreshes the replay
@@ -83,6 +84,7 @@
   var suppressWaiters = [];  // resolved when inject acks suppress-booking-on
   var preparedWaiters = [];  // resolved when inject finishes prepare-direct
   var directWaiters = [];    // resolved by a direct-book result
+  var raceWaiters = [];      // resolved by the race log after the salvo
   var lastAppSlots = { body: "", ts: 0 }; // latest APP-initiated ListAvailableSlots response
   var onSlotsBody = null;    // UI-mode hook: called with EVERY availability body on arrival
 
@@ -131,6 +133,8 @@
       flushWaiters(preparedWaiters, d);
     } else if (d.type === "direct-book-result") {
       flushWaiters(directWaiters, d);
+    } else if (d.type === "race-log") {
+      flushWaiters(raceWaiters, d);
     }
   });
 
@@ -305,30 +309,86 @@
   // the same sub-second phase and the median was ONE random draw within
   // ±500ms. On 2026-10-08 it read -209ms while the server was really ~100ms
   // AHEAD: the shot left ~0.44s after the rollover and the slot was gone.
-  var clockOffsets = [];          // { lo, hi, t } per sample
+  //
+  // Direct mode adds a second source: Google's millisecond time service,
+  // read by the service worker (see background.js). Its stamp has no 1s
+  // truncation, so a sample is the interval [ms - tRecv, ms - tSent] — one
+  // round trip wide — and goes into the same Marzullo pool. Measured
+  // 2026-10-26: +82 ±20ms from it vs sntp time.google.com +80ms, while the
+  // Date headers alone bounded the offset to ±73-97ms on the last two nights.
+  // Those samples are kept for a shorter window: a tight interval taken
+  // minutes ago can exclude the offset after the Mac's clock has slewed.
+  var clockOffsets = [];          // { lo, hi, t, ms } per sample
   var CLOCK_WINDOW_MS = 180000;   // the Mac's clock slews; old samples go stale
+  var CLOCK_MS_WINDOW_MS = 40000; // ms-precise samples: newest bursts only
   var CLOCK_MAX_SAMPLES = 240;
   var CLOCK_BURST_MS = 1200;      // > 1s, so every burst straddles a server tick
   var clockFix = { off: 0, lo: 0, hi: 0, agree: 0 };
+  var msClockBest = null;         // min-RTT ms sample in the window, for the log
   var lastLoggedOffset = null;
+  var lastLoggedHadMs = false;
   var clockProbeWarned = false;
+  var timeProbeWarned = false;
   function noteClockSample(dateHeader, tSent, tRecv) {
     var s = Date.parse(dateHeader || "");
     if (!s || !tSent || !tRecv) return;
     var rtt = tRecv - tSent;
     if (rtt < 0 || rtt > 2000) return; // stalled request — poisoned sample
     clockOffsets.push({ lo: s - tRecv, hi: s + 1000 - tSent, t: tRecv });
+    noteClockFix(rtt, tRecv);
+  }
+  function noteMsClockSample(serverMs, tSent, tRecv) {
+    if (!serverMs || !tSent || !tRecv) return;
+    var rtt = tRecv - tSent;
+    if (rtt < 0 || rtt > 2000) return;
+    clockOffsets.push({ lo: serverMs - tRecv, hi: serverMs - tSent, t: tRecv, ms: true });
+    noteClockFix(rtt, tRecv);
+  }
+  // Ask the service worker for a burst of ms samples. Direct mode only; if the
+  // endpoint is unreachable, the Date headers carry on alone exactly as before.
+  function timeProbe(n) {
+    try {
+      chrome.runtime.sendMessage({ type: "time-probe", n: n }, function (resp) {
+        if (chrome.runtime.lastError || !resp) {
+          if (!timeProbeWarned) {
+            timeProbeWarned = true;
+            log("ms time probe unavailable (" + ((chrome.runtime.lastError && chrome.runtime.lastError.message) || "no reply") +
+                ") — Date headers only");
+          }
+          return;
+        }
+        (resp.samples || []).forEach(function (s) {
+          if (s.server) noteMsClockSample(s.server, s.tSent, s.tRecv);
+          else if (s.error && !timeProbeWarned) { timeProbeWarned = true; log("ms time probe failed: " + s.error); }
+        });
+      });
+    } catch (e) {
+      if (!timeProbeWarned) { timeProbeWarned = true; log("ms time probe failed: " + String(e)); }
+    }
+  }
+  function noteClockFix(rtt, tRecv) {
     while (clockOffsets.length > CLOCK_MAX_SAMPLES || tRecv - clockOffsets[0].t > CLOCK_WINDOW_MS) clockOffsets.shift();
-    clockFix = marzullo(clockOffsets);
-    // Log the first fix and any material drift; a per-sample log would be ~20/s
-    // during a burst.
+    var pool = clockOffsets.filter(function (c) { return !c.ms || tRecv - c.t <= CLOCK_MS_WINDOW_MS; });
+    msClockBest = null;
+    pool.forEach(function (c) {
+      if (c.ms && (!msClockBest || c.hi - c.lo < msClockBest.rtt)) {
+        msClockBest = { off: (c.lo + c.hi) / 2, rtt: c.hi - c.lo };
+      }
+    });
+    clockFix = marzullo(pool);
+    // Log the first fix, the first ms-precise one, and any material drift; a
+    // per-sample log would be ~20/s during a burst.
     var off = clockFix.off;
-    if (lastLoggedOffset === null || Math.abs(off - lastLoggedOffset) > 50) {
+    var firstMs = msClockBest && !lastLoggedHadMs;
+    if (lastLoggedOffset === null || firstMs || Math.abs(off - lastLoggedOffset) > 50) {
       lastLoggedOffset = off;
+      lastLoggedHadMs = !!msClockBest;
       log("clock sync: server offset " + (off >= 0 ? "+" : "") + Math.round(off) + "ms" +
           " ±" + Math.round((clockFix.hi - clockFix.lo) / 2) + "ms (" + clockFix.agree + "/" +
-          clockOffsets.length + " samples agree, rtt " + rtt + "ms), midnight in " +
-          (msToRollover() / 1000).toFixed(1) + "s");
+          pool.length + " samples agree, rtt " + rtt + "ms" +
+          (msClockBest ? ", ms clock " + (msClockBest.off >= 0 ? "+" : "") + Math.round(msClockBest.off) +
+                         " ±" + Math.round(msClockBest.rtt / 2) : "") +
+          "), midnight in " + (msToRollover() / 1000).toFixed(1) + "s");
     }
   }
   // The offset range covered by the most sample intervals, and its middle.
@@ -848,14 +908,22 @@
   // challenge means no shot that night.
   var DIRECT_PREP_LEAD_MS = 20000;
   // Captures are strictly sequential (one modal in the DOM at a time), so each
-  // extra slot needs its own window of lead time. Only the FIRST token pays the
-  // full wait; later ones are younger.
-  var DIRECT_PREP_PER_JOB_MS = 12000;
-  function directPrepLeadMs(n) { return DIRECT_PREP_LEAD_MS + Math.max(0, n - 1) * DIRECT_PREP_PER_JOB_MS; }
+  // extra capture — another shot, another slot — needs its own window of lead
+  // time. Measured 2.1-3s per capture; 5s leaves room for a slow one. Only the
+  // FIRST token pays the full wait; later ones are younger. `n` counts
+  // captures, not slots.
+  var DIRECT_PREP_PER_CAPTURE_MS = 5000;
+  function directPrepLeadMs(n) { return DIRECT_PREP_LEAD_MS + Math.max(0, n - 1) * DIRECT_PREP_PER_CAPTURE_MS; }
   // Least time in which a capture is worth starting. Kept tight on purpose: the
   // capture aborts itself (closing its modal) if it would otherwise still be
   // open at the rollover.
   var DIRECT_PREP_MIN_MS = 7000;
+  // The same floor for a slot's EXTRA shots, much higher. A capture can take
+  // ~8s when reCAPTCHA is slow (6s capture wait + modal), and the salvo is
+  // only scheduled once the capture loop returns — so a late extra capture
+  // would hold back the shots that are already prepared. A slot's first shot
+  // keeps the 7s floor: without it there is no shot at all.
+  var DIRECT_EXTRA_SHOT_MIN_MS = 16000;
   var CAPTURE_ABORT_MS = 1800;
   // How far past the rollover a prepared shot is still worth firing.
   var FIRE_LATE_GRACE_MS = 60000;
@@ -871,13 +939,40 @@
     if (!clockOffsets.length) return DIRECT_SEND_DELAY_MS;
     return Math.min(DIRECT_SEND_DELAY_MS, spread + DIRECT_SEND_MARGIN_MS);
   }
+  // The salvo. Every slot gets SHOTS_PER_JOB shots, each carrying its own
+  // token: a token is spent by the first request that carries it. The LAST
+  // shot is the safe one, fired directSendDelayMs() after corrected midnight
+  // so it cannot arrive early — the v0.5.1 single shot. The others leave
+  // BEFORE midnight, at these offsets. Why that can win: the server assesses
+  // the reCAPTCHA token before it looks at the slot (an early request still
+  // burns its token — measured 2026-10-26), and the request needs ~20ms to
+  // reach Google, so a shot that leaves a little early can still meet an open
+  // slot, ahead of everything sent at midnight. One that is too early gets
+  // 404 and costs nothing but its own token.
+  //
+  // When fewer shots got prepared, the safe offset is assigned first: a lone
+  // shot fires exactly where the v0.5.1 single shot did.
+  var DIRECT_EARLY_SHOTS_MS = [-100, -50];
+  var SHOTS_PER_JOB = DIRECT_EARLY_SHOTS_MS.length + 1;
+  function shotOffsetsMs(n, sendDelay) {
+    return DIRECT_EARLY_SHOTS_MS.slice(DIRECT_EARLY_SHOTS_MS.length - (n - 1)).concat([sendDelay]);
+  }
+  // One availability replay this long before the rollover keeps the page's
+  // connection to calendar-pa open for the shots. The clock probes talk to
+  // calendar.google.com, a different server (different IP), and the last app
+  // fetch can be ~45s old by then — so the first shot could otherwise pay a
+  // fresh handshake (TCP+TLS measured 80-120ms).
+  var DIRECT_WARM_LEAD_MS = 2500;
+  // Race log window around corrected midnight — see raceWatch in inject.js.
+  var RACE_FROM_MS = -300;
+  var RACE_UNTIL_MS = 1500;
 
   // ---------- direct shot ----------
   // Shortly before midnight we let the page build a COMPLETE booking request
   // for a sacrificial already-open slot (real form data, real Book click, so
   // the page mints its own reCAPTCHA token), swallow it before it reaches the
-  // network, rewrite the slot epochs to the target, and fire it at corrected
-  // midnight — the booking arrives one RTT after the rollover.
+  // network, rewrite the slot epochs to the target, and fire it around
+  // corrected midnight — once per shot of the salvo, each with its own token.
   //
   // Set while a capture has a Book click in flight on a SACRIFICIAL slot. Until
   // it settles, the swallow in inject.js is the only thing stopping that slot
@@ -893,9 +988,9 @@
     capturePending = { promise: p, done: resolve };
   }
 
-  async function prepareDirectBooking(td, job, myGen) {
+  async function prepareDirectBooking(td, job, shot, myGen) {
     try {
-      setStatus("Готовлю прямой запрос для " + job.label + "…");
+      setStatus("Готовлю прямой запрос для " + shot.label + "…");
       if (dialogEl()) { await closeModal(); if (!live(myGen)) return false; }
       var all = slotButtonsAll();
       if (!all.length) { log("direct prep: no slot buttons on screen"); return false; }
@@ -961,10 +1056,10 @@
         [ymd(pd), ymd(td)]
       ];
       var prep = await awaitMsg(preparedWaiters, 3000, function () {
-        toInject({ cmd: "prepare-direct", id: job.id, repl: repl });
-      }, byId(job.id));
+        toInject({ cmd: "prepare-direct", id: shot.id, repl: repl });
+      }, byId(shot.id));
       if (!prep || !prep.ok) { log("direct prep: epoch rewrite failed", prep && prep.counts); return false; }
-      log("direct shot prepared for " + job.label + ", replacement counts:", prep.counts);
+      log("direct shot prepared for " + shot.label + ", replacement counts:", prep.counts);
       return true;
     } catch (e) {
       log("direct prep error", e);
@@ -980,26 +1075,48 @@
     }
   }
 
-  // Capture one request per job, sequentially (single modal in the DOM). Each
-  // job gets its own reCAPTCHA token because tokens are single-use. Stops early
-  // if midnight gets too close to finish another capture safely.
+  // Capture one request per SHOT, sequentially (single modal in the DOM). Each
+  // shot gets its own reCAPTCHA token because tokens are single-use. Round by
+  // round — every slot's first shot, then every slot's second — so a night
+  // that runs short of time still has a shot for every slot. Stops early if
+  // midnight gets too close to finish another capture safely.
   async function prepareDirectShots(td, jobs, myGen) {
-    for (var i = 0; i < jobs.length; i++) {
-      var job = jobs[i];
-      if (job.prepared) continue;
-      if (msToRollover() < DIRECT_PREP_MIN_MS) {
-        log("direct prep: not enough time left for " + job.label);
-        break;
+    for (var k = 0; k < SHOTS_PER_JOB; k++) {
+      for (var i = 0; i < jobs.length; i++) {
+        var job = jobs[i], shot = job.shots[k];
+        if (shot.prepared) continue;
+        if (msToRollover() < DIRECT_PREP_MIN_MS) {
+          log("direct prep: not enough time left for " + shot.label);
+          return;
+        }
+        if (job.prepared && msToRollover() < DIRECT_EXTRA_SHOT_MIN_MS) {
+          log("direct prep: skipping " + shot.label + " — too close to the rollover for an extra shot");
+          continue;
+        }
+        shot.prepared = await prepareDirectBooking(td, job, shot, myGen);
+        if (shot.prepared) job.prepared = true;   // a slot with any shot is armed
+        if (!live(myGen)) return;
       }
-      job.prepared = await prepareDirectBooking(td, job, myGen);
-      if (!live(myGen)) return;
     }
+  }
+  function makeShots(job) {
+    job.shots = [];
+    for (var k = 0; k < SHOTS_PER_JOB; k++) {
+      job.shots.push({ id: job.id + (k + 1), k: k, prepared: false, label: job.label + " #" + (k + 1) });
+    }
+  }
+  function preparedShots(job) {
+    return (job.shots || []).filter(function (s) { return s.prepared; });
+  }
+  // "19:00 (Dmytro) 3/3 + 20:30 (Pavlo) 2/3"
+  function shotCounts(jobs) {
+    return jobs.map(function (j) { return j.label + " " + preparedShots(j).length + "/" + SHOTS_PER_JOB; }).join(" + ");
   }
 
   // Signed offset to corrected midnight, the number to compare across nights.
   function fmtT(ms) { return (ms >= 0 ? "T+" : "T-") + (Math.abs(ms) / 1000).toFixed(3) + "s"; }
 
-  // inject gets the deadline SECONDS in advance and fires from its own timer
+  // inject gets the deadlines SECONDS in advance and fires from its own timers
   // (see arm-fire): a "fire now" postMessage would cost an event-loop turn and
   // could queue behind the app's rendering at exactly the wrong moment.
   //
@@ -1020,37 +1137,69 @@
     var offset = Math.round(clockOffset());
     var spread = Math.round((clockFix.hi - clockFix.lo) / 2); // ± bound on that offset
     var sendDelay = directSendDelayMs(spread);
-    var fireAt = Math.max(Date.now(), midnightAt) + sendDelay;
+    var fireAt = Math.max(Date.now(), midnightAt) + sendDelay;   // the safe shot
     // Send times are reported against midnight on THIS machine's clock, not
     // the corrected one: against the estimate every shot reads ~T+sendDelay by
     // construction, which hides exactly the error worth seeing — the Date-
     // header estimate itself drifts by 100ms+ from night to night.
     var wallMidnightAt = midnightAt + offset;
-    log("midnight fire scheduled in " + (fireAt - Date.now()) + "ms " +
-        "(clock offset " + offset + "ms ±" + spread + "ms, " + clockFix.agree + "/" + clockOffsets.length + " samples agree, send delay " +
-        sendDelay + "ms), armed jobs: " + jobTimes(armed));
+
+    // Each slot's prepared shots, in capture order, take the salvo's offsets:
+    // the last one the safe moment, the ones before it the early offsets.
+    var shots = [];
+    armed.forEach(function (j) {
+      var ps = preparedShots(j);
+      var offs = shotOffsetsMs(ps.length, sendDelay);
+      ps.forEach(function (sh, i) {
+        var safe = (i === ps.length - 1);
+        shots.push({ job: j, shot: sh, offMs: offs[i], safe: safe,
+                     at: safe ? fireAt : Math.max(Date.now(), midnightAt + offs[i]) });
+      });
+    });
+    // One timer per moment: shots of different slots sharing an offset leave
+    // in the same callback, as both slots' single shots did before.
+    var byAt = {};
+    shots.forEach(function (x) { (byAt[x.at] = byAt[x.at] || []).push(x.shot.id); });
+    var plan = Object.keys(byAt).map(function (at) { return { ids: byAt[at], at: +at }; })
+      .sort(function (a, b) { return a.at - b.at; });
+    var lastAt = plan[plan.length - 1].at;
+    log("midnight salvo scheduled, corrected midnight in " + Math.round(midnightAt - Date.now()) + "ms: " +
+        plan.map(function (g) { return "[" + g.ids.join(",") + "] " + fmtT(g.at - midnightAt); }).join(", ") +
+        " (clock offset " + offset + "ms ±" + spread + "ms, " + clockFix.agree + "/" + clockOffsets.length + " samples agree" +
+        (msClockBest ? ", ms clock " + Math.round(msClockBest.off) + " ±" + Math.round(msClockBest.rtt / 2) : ", no ms clock") +
+        ", send delay " + sendDelay + "ms), armed jobs: " + shotCounts(armed));
 
     // Result waiters first, then arm: the reply can arrive one RTT after the
     // deadline, which may be sooner than this function is resumed.
-    var shots = armed.map(function (j) {
-      return awaitMsg(directWaiters, Math.max(8000, fireAt - Date.now() + 5000), null, byId(j.id))
+    var waits = shots.map(function (x) {
+      return awaitMsg(directWaiters, Math.max(8000, x.at - Date.now() + 5000), null, byId(x.shot.id))
         .then(function (res) {
-          log("fire result for " + j.label + ": status " + ((res && res.status) || "timeout") +
+          log("fire result for " + x.shot.label + ": status " + ((res && res.status) || "timeout") +
               ((res && res.error) ? " error=" + res.error : "") +
               ((res && res.body) ? " body=" + String(res.body).slice(0, 200) : ""));
-          return { job: j, res: res };
+          x.res = res;
+          return x;
         });
     });
-    toInject({ cmd: "arm-fire", ids: armed.map(function (j) { return j.id; }), at: fireAt });
+    var raceP = awaitMsg(raceWaiters, Math.max(8000, midnightAt + RACE_UNTIL_MS - Date.now() + 5000));
+    toInject({ cmd: "arm-fire", plan: plan });
+    toInject({ cmd: "race-watch", from: midnightAt + RACE_FROM_MS, until: midnightAt + RACE_UNTIL_MS });
+    if (midnightAt - Date.now() > 1000) {
+      setTimeout(function () {
+        if (live(myGen)) toInject({ cmd: "replay", rid: 0 });   // warm-up, nobody waits on it
+      }, Math.max(0, midnightAt - DIRECT_WARM_LEAD_MS - Date.now()));
+    }
     setTimeout(function () {
       if (!live(myGen)) return;
-      setStatus(armed.length > 1
-        ? "Полночь — " + armed.length + " прямых запроса ушли ⚡"
-        : "Полночь — прямой запрос ушёл ⚡");
-    }, Math.max(0, fireAt - Date.now()) + 60);
+      setStatus("Полночь — " + shotsWord(shots.length) + " ⚡");
+    }, Math.max(0, lastAt - Date.now()) + 60);
 
-    var settled = await Promise.all(shots);
+    var settled = await Promise.all(waits);
     if (!live(myGen)) return;
+    var raceLog = await raceP;
+    if (!live(myGen)) return;
+    var raceRows = summarizeRace(raceLog && raceLog.samples, td, armed, midnightAt);
+    log("race log (ms vs corrected midnight; day = target-day slots listed):", JSON.stringify(raceRows));
     // A 200 can still hide an in-body error, so a win needs POSITIVE evidence
     // that the slot is gone. An empty body means the check itself failed
     // (timeout, network error) — one retry, since this runs in the congested
@@ -1067,14 +1216,21 @@
     if (!verified) log("verification UNAVAILABLE — reporting the raw HTTP results only");
 
     var lines = [], report = [];
-    settled.forEach(function (s) {
+    armed.forEach(function (j) {
+      var mine = settled.filter(function (x) { return x.job === j; });
+      var hits = mine.filter(function (x) { return x.res && x.res.status === 200; });
+      // The job's verdict comes from a 200 if any shot got one, otherwise
+      // from the safe shot — with one shot, that is the shot.
+      var best = hits[0] || mine[mine.length - 1];
+      var s = { job: j, res: best.res };
       var r = s.res || {};
       var http = r.status || 0;
       var stillOpen = verified && bodiesContainTarget([body], td, s.job.timeMin);
       var gone = verified && !stillOpen;
       var why = (s.res ? "HTTP " + http : "нет ответа") + (r.error ? " " + r.error : "") +
                 ", отправлен " + (r.sentAt ? fmtT(r.sentAt - wallMidnightAt) : "?") +
-                (r.ms != null ? ", ответ за " + r.ms + "мс" : "");
+                (r.ms != null ? ", ответ за " + r.ms + "мс" : "") +
+                (mine.length > 1 ? ", выстрел " + (mine.indexOf(best) + 1) + " из " + mine.length : "");
       var server = r.body ? ": " + String(r.body).slice(0, 120) : "";
       var verdict, line;
       if (http === 200 && gone) {
@@ -1094,11 +1250,30 @@
         verdict = "failed";
         line = "❌ " + s.job.label + ": не вышло, проверить слот не удалось (" + why + ")" + server;
       }
+      // Our own shots can't double-book a single-capacity slot unless the
+      // server lets two concurrent bookings through; say so if it ever does.
+      if (hits.length > 1) line += "\n⚠️ " + hits.length + " выстрела получили 200 — возможна двойная бронь, проверь почту";
+      if (mine.length > 1) {
+        line += "\n   выстрелы (от полуночи сервера): " + mine.map(function (x) {
+          var xr = x.res || {};
+          return (xr.sentAt ? fmtT(xr.sentAt - midnightAt) : "?") + " " + (xr.status || (x.res ? 0 : "—"));
+        }).join(" · ");
+      }
+      var note = raceNote(raceRows, j);
+      if (note) line += "\n   " + note;
       log("verify " + s.job.label + ": http=" + http + " verified=" + verified + " slotStillOpen=" + stillOpen + " -> " + verdict);
       lines.push(line);
       report.push({ job: s.job.label, verdict: verdict, http: http, error: r.error || "",
                     sentT: r.sentAt ? r.sentAt - wallMidnightAt : null, ms: r.ms != null ? r.ms : null,
-                    body: String(r.body || "").slice(0, 400) });
+                    body: String(r.body || "").slice(0, 400),
+                    shots: mine.map(function (x) {
+                      var xr = x.res || {};
+                      return { shot: x.shot.k + 1, offMs: x.offMs, safe: x.safe, http: xr.status || 0, error: xr.error || "",
+                               sentT: xr.sentAt ? xr.sentAt - wallMidnightAt : null,
+                               sentServerT: xr.sentAt ? Math.round(xr.sentAt - midnightAt) : null,
+                               ms: xr.ms != null ? xr.ms : null, body: String(xr.body || "").slice(0, 160) };
+                    }),
+                    race: note });
     });
     jobs.filter(function (j) { return !j.prepared; }).forEach(function (j) {
       lines.push("❌ " + j.label + ": прямой запрос не был подготовлен");
@@ -1113,10 +1288,54 @@
       wallMidnightAt: wallMidnightAt, midnightAt: midnightAt, fireAt: fireAt,
       fireT: fireAt - wallMidnightAt, clockOffsetMs: offset, clockSamples: clockOffsets.length,
       clockSpreadMs: spread, clockAgree: clockFix.agree, sendDelayMs: sendDelay,
+      clockMs: msClockBest ? { off: Math.round(msClockBest.off), rtt: msClockBest.rtt } : null,
+      shotOffsetsMs: shots.map(function (x) { return x.shot.id + ":" + Math.round(x.at - midnightAt); }),
+      race: raceRows.slice(0, 40),
       verified: verified, jobs: report
     } });
     notify(won === jobs.length ? "✅ Padel забронирован" : "Padel: результат выстрела", lines.join("\n"), true);
     await setState("idle");
+  }
+  // "прямой запрос ушёл" / "3 прямых запроса ушли" / "6 прямых запросов ушли"
+  function shotsWord(n) {
+    if (n === 1) return "прямой запрос ушёл";
+    return n + (n >= 2 && n <= 4 ? " прямых запроса ушли" : " прямых запросов ушли");
+  }
+
+  // What the availability list showed around the rollover. Per replay: when
+  // it left and came back (ms vs corrected midnight), how many of the target
+  // day's slots it listed, and which of our slots were among them.
+  function summarizeRace(samples, td, jobs, midnightAt) {
+    var dayStart = parseInt(targetEpochCandidates(td, 0)[1], 10);   // court 00:00 as unix seconds
+    return (samples || []).map(function (x) {
+      var seen = {};
+      String(x.body || "").replace(/(^|[^0-9])(1\d{9})(?=[^0-9]|$)/g, function (m, pre, sec) {
+        if (+sec >= dayStart && +sec < dayStart + 86400) seen[sec] = true;
+        return m;
+      });
+      var row = { s: Math.round(x.tSent - midnightAt), r: Math.round(x.tRecv - midnightAt),
+                  http: x.status || 0, day: Object.keys(seen).length, has: [] };
+      jobs.forEach(function (j) { if (x.body && bodiesContainTarget([x.body], td, j.timeMin)) row.has.push(j.id); });
+      return row;
+    });
+  }
+  // A replay is answered somewhere between leaving and coming back, so every
+  // moment here is a bracket, not a point.
+  function raceNote(rows, job) {
+    if (!rows.length) return "";
+    var opened = -1;
+    for (var i = 0; i < rows.length; i++) if (rows[i].day > 0) { opened = i; break; }
+    if (opened < 0) return "гонка: день не появился в списке до " + fmtT(rows[rows.length - 1].r);
+    var note = "гонка: день открылся " + (opened > 0 ? "между " + fmtT(rows[opened - 1].s) + " и " : "до ") +
+               fmtT(rows[opened].r);
+    var lastSeen = -1;
+    for (var k = opened; k < rows.length; k++) if (rows[k].has.indexOf(job.id) !== -1) lastSeen = k;
+    if (lastSeen < 0) return note + ", " + job.time + " ни разу не был в списке";
+    note += ", " + job.time + " был в списке до " + fmtT(rows[lastSeen].s);
+    for (var m = lastSeen + 1; m < rows.length; m++) {
+      if (rows[m].day > 0 && rows[m].has.indexOf(job.id) === -1) return note + ", пропал к " + fmtT(rows[m].r);
+    }
+    return note;
   }
 
   // A date that is already bookable (or past) never gets a shot: the shot only
@@ -1166,11 +1385,12 @@
     }
     log("booking mode: direct shot");
     if (shotWindowPassed(td)) { await refuseOpenDate(cfg); return; }
+    jobs.forEach(makeShots);
 
     setStatus("Жду полночь " + shotNightLabel(td) + ": прямой запрос на " + jobTimes(jobs) + ", " + cfg.targetDate);
 
     var attempts = 0;
-    var prepLead = directPrepLeadMs(jobs.length);
+    var prepLead = directPrepLeadMs(jobs.length * SHOTS_PER_JOB);
     var nextMaint = 0;          // refetch on the first pass: the post-shot check needs a template
     var nextProbe = 0;
     while (live(myGen)) {
@@ -1186,6 +1406,7 @@
         var nearProbe = Math.abs(leftMs) < 120000;
         nextProbe = Date.now() + (nearProbe ? 15000 : 60000);
         toInject({ cmd: "clock-probe", burstMs: nearProbe ? CLOCK_BURST_MS : 0 });
+        timeProbe(nearProbe ? 6 : 3);
       }
       // Upkeep comes first so a capture (or its retry) starts from a parked
       // view with an open slot on screen — and none of it near the rollover.
@@ -1204,15 +1425,21 @@
         leftMs = msToRollover();          // the upkeep can take a second
       }
       if (opensTonight) {
-        var pending = jobs.filter(function (j) { return !j.prepared; });
+        // Pending = any shot still without a token; a retry pass fills in
+        // just the missing ones.
+        var pending = jobs.filter(function (j) { return preparedShots(j).length < SHOTS_PER_JOB; });
         if (pending.length && attempts < 2 && leftMs <= prepLead && leftMs > DIRECT_PREP_MIN_MS) {
           attempts++;
           await prepareDirectShots(td, jobs, myGen);
           if (!live(myGen)) return;
           var missing = jobs.filter(function (j) { return !j.prepared; });
-          if (!missing.length) setStatus("Прямой запрос готов (" + jobTimes(jobs) + ") — жду полночь ⚡", "ok");
-          else setStatus("Не собрался прямой запрос для " + jobTimes(missing) +
-                         (attempts < 2 && msToRollover() > DIRECT_PREP_MIN_MS ? " — пробую ещё раз" : ""), "warn");
+          var retrying = attempts < 2 && msToRollover() > DIRECT_PREP_MIN_MS;
+          var partial = jobs.some(function (j) { return preparedShots(j).length < SHOTS_PER_JOB; });
+          if (missing.length) setStatus("Не собрался прямой запрос для " + jobTimes(missing) +
+                                        (retrying ? " — пробую ещё раз" : ""), "warn");
+          else if (partial) setStatus("Выстрелы готовы не все (" + shotCounts(jobs) + ")" +
+                                      (retrying ? " — добираю" : " — жду полночь ⚡"), "warn");
+          else setStatus("Прямые запросы готовы (" + shotCounts(jobs) + ") — жду полночь ⚡", "ok");
           parkedYmd = 0;                    // the sacrificial modal click moved focus
           continue;
         }
@@ -1778,7 +2005,7 @@
       // Not in the last stretch: restarting there would throw away prepared
       // shots (jobs are rebuilt with prepared=false) with no time to redo them.
       var left = msToRollover();
-      if (left > 0 && left < directPrepLeadMs(2) + 5000) {
+      if (left > 0 && left < directPrepLeadMs(2 * SHOTS_PER_JOB) + 5000) {
         log("config changed close to the rollover — keeping the armed snapshot for tonight");
         setStatus("Изменения применятся после полуночи — сейчас стреляю по старым настройкам", "warn");
         return;

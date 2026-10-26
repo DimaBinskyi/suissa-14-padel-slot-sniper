@@ -14,8 +14,10 @@
 //      ISOLATED content script via window.postMessage (the UI grab).
 //   3. During a capture, swallow the page's own BookSlot request and keep it
 //      as the direct-shot template (see below).
-//   4. Fire the prepared requests at the deadline the content script hands
-//      over, and report each one's HTTP result.
+//   4. Fire the prepared requests at the deadlines the content script hands
+//      over (one per shot of the salvo), and report each one's HTTP result.
+//   5. Around the rollover, replay ListAvailableSlots back to back and hand
+//      the answers over as the race log.
 (function () {
   "use strict";
 
@@ -40,9 +42,11 @@
   // kept as bookingTemplate. prepare-direct rewrites its slot epochs into
   // prepared[id], which direct-book fires verbatim at midnight.
   //
-  // prepared is keyed by job id so several slots can be armed at once (each
-  // from its own capture, since a reCAPTCHA token is single-use) and fired
-  // together at the rollover.
+  // prepared is keyed by SHOT id ("a1".."a3", "b1".."b3") so several shots per
+  // slot, and several slots, can be armed at once. Each comes from its own
+  // capture: a token is spent by the first request that carries it, even one
+  // the server turns away as not-open-yet — reusing it gets
+  // 400 ["recaptcha","DUPE"] (measured 2026-10-26).
   var bookingTemplate = null;
   var prepared = {};
   var suppress = null;          // { needle, until }
@@ -110,6 +114,66 @@
       post({ type: "direct-book-result", id: id, status: 0, body: "", error: String(err),
              sentAt: t0, ms: Date.now() - t0 });
     });
+  }
+
+  // One timer per shot moment; see arm-fire.
+  function armFireGroup(ids, at, myFireGen) {
+    log("arm-fire: [" + ids.join(",") + "] in " + (at - Date.now()) + "ms");
+    setTimeout(function () {
+      // Disarmed (or re-armed) in the meantime — the content script owns that
+      // decision, and a shot nobody asked for would book against the user.
+      if (myFireGen !== fireGen) { log("fire[" + ids.join(",") + "] cancelled"); return; }
+      // Late (throttled tab, machine asleep) is NOT a reason to hold back:
+      // a stale token just gets rejected, while not firing guarantees no
+      // booking. Only give up past the reCAPTCHA TTL, where it cannot work.
+      var late = Date.now() - at;
+      if (late > TOKEN_TTL_MS) {
+        log("fire skipped: " + (late / 1000).toFixed(1) + "s late, past the token TTL (tab throttled or machine asleep?)");
+        return;
+      }
+      if (late > 200) log("fire is " + late + "ms LATE — sending anyway");
+      // Busy-wait the last few ms: a timer can be late by more than that,
+      // and nothing may preempt us between here and the send.
+      while (Date.now() < at) { /* spin */ }
+      ids.forEach(function (id) { firePrepared(id); });
+    }, Math.max(0, at - Date.now() - FIRE_SPIN_MS));
+  }
+
+  // Record the race as the availability list saw it: replay ListAvailableSlots
+  // back to back from `from` to `until` and hand every answer over in ONE
+  // message at the end. A booking that loses gets the same 404 whether it
+  // came too early or too late (measured 2026-10-26), so this list is the only
+  // way to tell when the day opened and when the slot went.
+  //
+  // Chained on the network like the clock bursts, and each answer is only
+  // stored, never parsed here: the shots' timers share this thread, and the
+  // less that runs between them the better.
+  function raceWatch(from, until, myFireGen) {
+    var samples = [];
+    function step() {
+      if (myFireGen !== fireGen) return;          // cancelled — nobody wants the log
+      if (Date.now() > until || !template) {
+        post({ type: "race-log", samples: samples });
+        return;
+      }
+      var tSent = Date.now();
+      (origFetch || fetch).call(window, template.url, {
+        method: template.method,
+        headers: template.headers,
+        body: template.body,
+        credentials: "include"
+      }).then(function (r) {
+        return r.text().then(function (t) { return { status: r.status, body: t }; });
+      }).catch(function (err) {
+        return { status: 0, body: "", error: String(err) };
+      }).then(function (res) {
+        res.tSent = tSent;
+        res.tRecv = Date.now();
+        samples.push(res);
+        step();
+      });
+    }
+    setTimeout(step, Math.max(0, from - Date.now()));
   }
 
   // Rewrite every sacrificial identifier to its target counterpart in ONE pass.
@@ -286,9 +350,9 @@
         body: template.body,
         credentials: "include"
       }).then(function (r) {
-        // `Date` is NOT a CORS-safelisted response header and this endpoint is
-        // cross-origin, so this is usually null — see clock-probe for the
-        // same-origin fallback that actually works.
+        // Cross-origin, but readable: calendar-pa lists `date` in
+        // access-control-expose-headers (checked 2026-10-26), so a replay is a
+        // clock sample too. clock-probe stays the main source.
         var dh = null;
         try { dh = r.headers.get("date"); } catch (e2) { dh = null; }
         return r.text().then(function (t) {
@@ -379,29 +443,21 @@
       // behind whatever the Calendar app happens to be rendering at midnight.
       // So take the deadline ahead of time and fire from our own timer: then
       // the only requirement at T+0 is that the thread is free.
-      var ids = (d.ids || []).slice();
-      var at = +d.at || 0;
-      if (!ids.length || !at) { log("arm-fire ignored (no ids or no deadline)"); return; }
+      //
+      // `plan` is one { ids, at } group per shot moment — the salvo's early
+      // shots, then the safe one. Each group gets its OWN timer rather than
+      // one timer spinning through all of them: the thread must go back to the
+      // event loop after every send, and spinning from the first deadline to
+      // the last would hold it for ~150ms. Plain `ids` + `at` is a one-group
+      // plan.
+      var plan = (d.plan || [{ ids: d.ids, at: d.at }]).filter(function (g) {
+        return g && g.ids && g.ids.length && +g.at;
+      });
+      if (!plan.length) { log("arm-fire ignored (no ids or no deadline)"); return; }
       var myFireGen = ++fireGen;
-      log("arm-fire: [" + ids.join(",") + "] in " + (at - Date.now()) + "ms");
-      setTimeout(function () {
-        // Disarmed (or re-armed) in the meantime — the content script owns that
-        // decision, and a shot nobody asked for would book against the user.
-        if (myFireGen !== fireGen) { log("fire[" + ids.join(",") + "] cancelled"); return; }
-        // Late (throttled tab, machine asleep) is NOT a reason to hold back:
-        // a stale token just gets rejected, while not firing guarantees no
-        // booking. Only give up past the reCAPTCHA TTL, where it cannot work.
-        var late = Date.now() - at;
-        if (late > TOKEN_TTL_MS) {
-          log("fire skipped: " + (late / 1000).toFixed(1) + "s late, past the token TTL (tab throttled or machine asleep?)");
-          return;
-        }
-        if (late > 200) log("fire is " + late + "ms LATE — sending anyway");
-        // Busy-wait the last few ms: a timer can be late by more than that,
-        // and nothing may preempt us between here and the send.
-        while (Date.now() < at) { /* spin */ }
-        ids.forEach(function (id) { firePrepared(id); });
-      }, Math.max(0, at - Date.now() - FIRE_SPIN_MS));
+      plan.forEach(function (g) { armFireGroup(g.ids.slice(), +g.at, myFireGen); });
+    } else if (d.cmd === "race-watch") {
+      raceWatch(+d.from || Date.now(), +d.until || 0, fireGen);
     } else if (d.cmd === "cancel-fire") {
       if (fireGen) log("pending fire cancelled");
       fireGen++;
