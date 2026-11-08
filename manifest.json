@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Padel Slot Sniper",
-  "version": "0.6.0",
-  "description": "Books a Google Calendar appointment slot (padel court) the moment it opens — by a pre-captured request fired at midnight, or through the page's own UI. Notifies you if a captcha appears.",
+  "version": "0.7.0",
+  "description": "Books a Google Calendar appointment slot (padel court) the moment it opens — by a pre-captured request fired the moment the date opens, or through the page's own UI. Notifies you if a captcha appears.",
   "permissions": ["storage", "notifications"],
   "host_permissions": ["https://calendar.google.com/*", "https://clients2.google.com/*"],
   "action": {

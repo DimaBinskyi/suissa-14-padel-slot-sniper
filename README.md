@@ -4,9 +4,10 @@ A Chrome extension (Manifest V3) for a **Google Calendar Appointment Schedule**
 booking page. It books a slot the moment it opens, in one of two modes picked
 in the popup (**«Способ брони»**):
 
-- **⚡ Прямой запрос** (direct shot, default) — at the midnight a date opens,
-  it fires a salvo of three booking requests it captured from the page itself
-  ~30 s earlier: two just before the rollover, one just after it.
+- **⚡ Прямой запрос** (direct shot, default) — at the moment a date opens
+  (the **opening time**, see below), it fires a salvo of three booking requests
+  it captured from the page itself ~30 s earlier: two just before the rollover,
+  one just after it.
 - **🖱 Через интерфейс** (UI) — a replay radar watches availability and, the
   moment the slot appears, books it through the page's own form (~0.5 s after
   the rollover). It also catches a slot that frees up later (a cancellation),
@@ -18,6 +19,27 @@ instead of trying to defeat it.
 
 Built for the "Padel Suiza 14" court page, but works with any Google Calendar
 appointment schedule.
+
+## Opening time
+
+The court opens a new date at a fixed Madrid wall-clock time, set in the popup
+(**«Время открытия слотов»**, `cfg.openTime`, default **22:00**). It used to be
+midnight; it moved, so it is now a setting. Everything below that says
+"midnight", "the rollover" or `T` (`T-0.100s`, `midnight salvo scheduled`, …)
+means *this* moment — the salvo, the captures, the clock bursts and the race log
+are all timed against it, unchanged.
+
+- At opening time `T` on day D the date **D+2** opens. Measured live 2026-11-08:
+  Tue 10th had no times at 21:59 and six slots at 22:00:09. So the **Дата** you
+  arm for is the one the *coming* opening opens: today+2 before today's opening
+  time, today+3 after it.
+- **00:00** is the old behaviour exactly (the date opens two days after the day
+  it closes). The engine treats it as 24:00, the end of the day.
+- The time is read when the run starts (`startPolling`) from the armed config,
+  and changing it while armed restarts the run — except in the last stretch
+  before the shot, where tonight keeps its snapshot, like any other edit. A
+  config saved before the setting existed uses 22:00; an empty or unreadable
+  value is refused (status error) rather than guessed.
 
 ## What the live page looks like
 
@@ -103,7 +125,7 @@ While armed:
      server's answer go to the popup status, a notification, and `lastShot` in
      storage. Then the extension disarms.
 
-A date that is already bookable (or whose midnight has passed) is refused at
+A date that is already bookable (or whose opening has passed) is refused at
 arm time: the shot only exists at the rollover that opens it.
 
 ### UI mode
@@ -175,7 +197,9 @@ tab is running (`Вкладка календаря: v0.5.1 ✓`). If they differ
 1. Open the padel booking calendar tab (must stay open and **visible** around
    midnight — Chrome throttles timers in hidden tabs).
 2. Click the extension icon, pick **Способ брони**, set **Дата** (the date that
-   opens at the coming midnight, i.e. today + 2), **Время** and the profile(s).
+   opens at the coming opening time, i.e. today + 2 before today's opening
+   time), **Время открытия слотов** (default 22:00, Madrid), **Время** and the
+   profile(s).
 3. Click **Включить ожидание** any time before ~T−1 min (captures start at T−30 s, T−45 s for two slots).
 4. Direct mode: after the shot you get a notification and a per-slot report in
    the popup, e.g.
@@ -249,7 +273,7 @@ the court's midnight (`T-12.345s` / `T+0.150s`).
 | `[padel popup …]` | popup (right-click the popup → Inspect) |
 | `[padel bg …]` | notifications (`chrome://extensions` → *service worker*) |
 
-Key lines on a live night: `engine v0.6.0 loaded`, `booking mode: …`,
+Key lines on a live night: `engine v0.7.0 loaded`, `booking mode: …`, `opening time 22:00 Europe/Madrid`,
 `clock sync: server offset … ms clock …`, then in direct mode `booking request CAPTURED`,
 `prepare-direct[a1]: OK, replacements per pattern = …`,
 `midnight salvo scheduled, …: [a1,b1] T-0.100s, [a2,b2] T-0.050s, [a3,b3] T+0.036s`,

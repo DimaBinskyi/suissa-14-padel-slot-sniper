@@ -43,20 +43,28 @@ function writeDate(iso) {
   var dt = m ? { y: m[1], mo: m[2], d: m[3] } : defaultDate();
   el("yyyy").value = dt.y; el("mm").value = dt.mo; el("dd").value = dt.d;
 }
-// The rollover opens today+2, so that is the only date a fresh arm can be
-// waiting FOR. Defaulting to today left first-time users armed for a day that
-// can never open, with no direct shot and no explanation.
+// The coming rollover opens today+2, so that is the only date a fresh arm can
+// be waiting FOR. Defaulting to today left first-time users armed for a day
+// that can never open, with no direct shot and no explanation. Once today's
+// opening time has passed, today+2 is already open and the next one is +3
+// (00:00 never "passes": it is the end of the day).
 function defaultDate() {
   var t = new Date();
-  t.setDate(t.getDate() + 2);
+  var open = el("openTime").value.match(/^(\d{2}):(\d{2})$/);
+  var openMin = open ? (+open[1] * 60 + +open[2]) || 1440 : 1440;
+  t.setDate(t.getDate() + (t.getHours() * 60 + t.getMinutes() >= openMin ? 3 : 2));
   return { y: String(t.getFullYear()), mo: pad(t.getMonth() + 1), d: pad(t.getDate()) };
 }
 
-// ---- booking mode: "direct" (pre-captured request at midnight) or "ui" ----
+// The court opens a new date at this Madrid time (cfg.openTime, "HH:MM").
+// A cfg saved before the setting existed gets the default, like the engine.
+var DEFAULT_OPEN_TIME = "22:00";
+
+// ---- booking mode: "direct" (pre-captured request at the opening time) or "ui" ----
 // A cfg without a mode (saved before the switch existed) is a direct one.
 var MODE_HINT = {
-  direct: "Запрос собирается за ~20 с до полуночи и уходит в момент открытия даты. Стреляет только в полночь открытия.",
-  ui: "Радар ждёт появления слота и бронирует через форму на странице — в полночь или когда слот освободится."
+  direct: "Запрос собирается за ~20 с до открытия и уходит в момент открытия даты. Стреляет только в момент открытия.",
+  ui: "Радар ждёт появления слота и бронирует через форму на странице — в момент открытия или когда слот освободится."
 };
 function readMode() {
   var r = document.querySelector('input[name="mode"]:checked');
@@ -194,6 +202,7 @@ function readForm() {
   cfg.calendarUrl = DEFAULT_URL; // fixed, not user-editable
   cfg.mode = readMode();
   cfg.targetDate = readDate();
+  cfg.openTime = el("openTime").value;
   cfg.targetTime = el("targetTime").value;
   INFO.forEach(function (id) { cfg[id] = el(id).value; });
   // Second slot: same date, another time, booked with another profile's data.
@@ -242,6 +251,7 @@ async function restore() {
   el("calendarUrl").value = DEFAULT_URL;
   writeMode(cfg.mode);
   applyModeVisibility();
+  el("openTime").value = cfg.openTime == null ? DEFAULT_OPEN_TIME : cfg.openTime;   // before writeDate: its default depends on it
   writeDate(cfg.targetDate);
   if (cfg.targetTime) el("targetTime").value = cfg.targetTime;
 
@@ -283,7 +293,7 @@ async function restore() {
 
 async function saveCfg() {
   var cfg = readForm();
-  log("cfg saved:", "mode=" + cfg.mode, "date=" + cfg.targetDate, "slot1=" + cfg.targetTime + " <" + cfg.email + "> кв." + cfg.flat,
+  log("cfg saved:", "mode=" + cfg.mode, "date=" + cfg.targetDate, "open=" + cfg.openTime, "slot1=" + cfg.targetTime + " <" + cfg.email + "> кв." + cfg.flat,
       cfg.second ? "slot2=" + cfg.second.time + " <" + cfg.second.email + "> кв." + cfg.second.flat : "slot2=off");
   await set({ cfg: cfg });
 }
@@ -291,6 +301,9 @@ async function saveCfg() {
 // Returns an error string, or "" when the config can be armed.
 function cfgProblem(cfg) {
   if (!cfg.targetDate || !cfg.targetTime) return "Заполни дату и время.";
+  // An empty time field saves as "", which the engine refuses rather than
+  // guessing — better to say so here than to arm a run that never fires.
+  if (!cfg.openTime) return "Укажи время открытия слотов.";
   // An empty name/email books a blank form, so require both here rather than
   // finding out at midnight.
   if (!cfg.firstName || !cfg.email) return "Заполни имя и email для первой брони.";
@@ -356,7 +369,7 @@ function init() {
   buildDateSelects();
   restore();
   // Autosave: selects/checkbox on change, text inputs on every keystroke.
-  ["dd", "mm", "yyyy", "targetTime", "secondTime", "secondProfile"].forEach(function (id) {
+  ["dd", "mm", "yyyy", "openTime", "targetTime", "secondTime", "secondProfile"].forEach(function (id) {
     el(id).addEventListener("change", saveCfg);
   });
   el("secondOn").addEventListener("change", function () {

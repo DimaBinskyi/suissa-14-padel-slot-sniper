@@ -252,6 +252,27 @@
   var FMT_DAY = new Intl.DateTimeFormat("en-GB", {
     timeZone: COURT_TZ, year: "numeric", month: "2-digit", day: "2-digit"
   });
+  // The court opens a new date at a fixed wall-clock time in COURT_TZ — the
+  // "opening time", cfg.openTime = "HH:MM", chosen in the popup. It used to be
+  // 00:00 sharp, which is why the code still says midnight*/rollover* for the
+  // moment everything is timed against; read those as "the opening time".
+  //
+  // Stored as seconds into the court day. 00:00 is kept as 24:00, the END of
+  // the day, because that is how the midnight rollover always behaved: it opens
+  // the date two days after the day it closes. Any other time T opens, at T on
+  // day D, day D+2 (measured live 2026-11-08: Tue 10th was empty at 21:59 and
+  // had six slots at 22:00:09).
+  //
+  // Set per run from the armed config (startPolling), never from live storage:
+  // a popup edit in the last stretch must not move tonight's shot.
+  var DEFAULT_OPEN_TIME = "22:00";
+  function openSecFromCfg(cfg) {
+    var t = String(cfg.openTime == null ? DEFAULT_OPEN_TIME : cfg.openTime).trim().match(/^(\d{1,2}):(\d{2})$/);
+    if (!t || +t[1] > 23 || +t[2] > 59) return -1;
+    var m = +t[1] * 60 + +t[2];
+    return (m === 0 ? 1440 : m) * 60;
+  }
+  var openSec = openSecFromCfg({});
   // The candidates for a given slot never change, and the detector compares
   // against them on every response — memoise per target.
   var epochCache = {};
@@ -280,8 +301,10 @@
     }
     return out;
   }
-  // The booking window rolls over at midnight in the COURT's timezone, and that
-  // is when the new day's slots appear — the moment the direct shot aims at.
+  // The booking window rolls over at the opening time in the COURT's timezone
+  // (see openSec), and that is when the new day's slots appear — the moment the
+  // direct shot aims at. For 00:00 (openSec 86400) this is exactly the old
+  // "86400 - secs until midnight".
   // `now` is passed in so the caller's sub-second correction is taken from the
   // same instant; reading the clock twice can straddle a second boundary and
   // put the result a full second out.
@@ -289,7 +312,9 @@
     var p = {};
     FMT_CLOCK.formatToParts(new Date(now || Date.now())).forEach(function (x) { p[x.type] = x.value; });
     var secs = ((+p.hour) % 24) * 3600 + (+p.minute) * 60 + (+p.second);
-    return (86400 - secs) * 1000;
+    var left = openSec - secs;
+    if (left <= 0) left += 86400;   // today's opening time is behind us: the next is tomorrow's
+    return left * 1000;
   }
   // ---------- server clock sync ----------
   // The rollover happens on GOOGLE's clock, not this machine's, and this Mac's
@@ -427,18 +452,32 @@
     var left = msUntilCourtMidnightCorrected();
     return left > 43200000 ? left - 86400000 : left;
   }
-  // Which rollover opens the target: before midnight the next one reveals
-  // today+2; just after, the day that opened is today+1 because the court date
-  // has already advanced. Deriving this from courtYmdPlus(2) alone made the
-  // whole direct-shot path switch itself off the moment midnight passed.
-  function targetOpensAtThisRollover(td) {
-    return ymd(td) === courtYmdPlus(msToRollover() > 0 ? 2 : 1);
+  // Which rollover opens the target. The nearest trigger (the one the signed
+  // msToRollover() points at, before or after it) belongs to a court day D — the
+  // day whose clock reads the opening time, 00:00 counting as the END of D — and
+  // opens D+2. At midnight that is "today+2 before it, today+1 after it" because
+  // the court date advances right at the trigger; at any other opening time the
+  // date does not, so it is derived from the trigger itself. Deriving it from
+  // courtYmdPlus(2) alone made the whole direct-shot path switch itself off the
+  // moment the rollover passed.
+  //   opened  = the date that trigger opens
+  //   through = the last date already bookable (the previous trigger's, while
+  //             this one is still ahead)
+  // D is read at its NOON, which is immune to ms rounding and DST wobble.
+  function triggerDays() {
+    var d = msToRollover();
+    var noonOfD = Date.now() + clockOffset() + d - openSec * 1000 + 43200000;
+    return { opened: courtYmdPlus(2, noonOfD), through: courtYmdPlus(d > 0 ? 1 : 2, noonOfD) };
   }
-  // Court-timezone date `days` ahead as "YYYYMMDD". The upcoming midnight
-  // rollover opens courtYmdPlus(2): entering day X+1 reveals day X+2.
-  function courtYmdPlus(days) {
+  function targetOpensAtThisRollover(td) {
+    return ymd(td) === triggerDays().opened;
+  }
+  // Court-timezone date `days` ahead of `atMs` (default: now) as "YYYYMMDD".
+  // The upcoming rollover opens day D+2 for the court day D it belongs to
+  // (see triggerDays); at midnight, entering day X+1 reveals day X+2.
+  function courtYmdPlus(days, atMs) {
     var p = {};
-    FMT_DAY.formatToParts(new Date()).forEach(function (x) { p[x.type] = x.value; });
+    FMT_DAY.formatToParts(new Date(atMs == null ? Date.now() : atMs)).forEach(function (x) { p[x.type] = x.value; });
     var dt = new Date(Date.UTC(+p.year, +p.month - 1, +p.day + days));
     return "" + dt.getUTCFullYear() + pad(dt.getUTCMonth() + 1) + pad(dt.getUTCDate());
   }
@@ -1126,7 +1165,7 @@
   async function scheduleMidnightFire(td, jobs, cfg, myGen) {
     var armed = jobs.filter(function (j) { return j.prepared; });
     if (!armed.length) {
-      setStatus("Прямой запрос не подготовлен — в эту полночь выстрела нет", "error");
+      setStatus("Прямой запрос не подготовлен — в момент открытия выстрела нет", "error");
       notify("Padel: выстрела не было", "Прямой запрос на " + cfg.targetDate + " не собрался.", true);
       await setState("idle");
       return;
@@ -1191,7 +1230,7 @@
     }
     setTimeout(function () {
       if (!live(myGen)) return;
-      setStatus("Полночь — " + shotsWord(shots.length) + " ⚡");
+      setStatus("Открытие — " + shotsWord(shots.length) + " ⚡");
     }, Math.max(0, lastAt - Date.now()) + 60);
 
     var settled = await Promise.all(waits);
@@ -1340,20 +1379,23 @@
 
   // A date that is already bookable (or past) never gets a shot: the shot only
   // exists at the rollover that opens the date. msToRollover stays negative for
-  // hours after midnight, so "opens at this rollover" alone does not rule it out.
+  // hours after the rollover, so "opens at this rollover" alone does not rule it out.
   function shotWindowPassed(td) {
     var inShotWindow = targetOpensAtThisRollover(td) && msToRollover() > -FIRE_LATE_GRACE_MS;
-    return +ymd(td) <= +courtYmdPlus(1) && !inShotWindow;
+    return +ymd(td) <= +triggerDays().through && !inShotWindow;
   }
   function refuseOpenDate(cfg) {
-    setStatus("Дата " + cfg.targetDate + " уже открыта — прямой запрос стреляет только в полночь её открытия. Выключаю.", "error");
+    setStatus("Дата " + cfg.targetDate + " уже открыта — прямой запрос стреляет только в момент её открытия. Выключаю.", "error");
     return setState("idle");
   }
 
-  // The rollover that opens td is the midnight that STARTS the day before it.
+  // The rollover that opens td is the opening time on the day two days before
+  // it — for 00:00, the midnight that STARTS the day before it.
   function shotNightLabel(td) {
-    var d = new Date(Date.UTC(td.y, td.m - 1, td.d - 1));
-    return "00:00 " + pad(d.getUTCDate()) + "." + pad(d.getUTCMonth() + 1);
+    var midnight = openSec === 86400;
+    var d = new Date(Date.UTC(td.y, td.m - 1, td.d - (midnight ? 1 : 2)));
+    var mins = midnight ? 0 : openSec / 60;
+    return pad(Math.floor(mins / 60)) + ":" + pad(mins % 60) + " " + pad(d.getUTCDate()) + "." + pad(d.getUTCMonth() + 1);
   }
 
   async function startPolling(myGen) {
@@ -1363,6 +1405,13 @@
     var td = parseTargetDate(cfg.targetDate);
     var jobs = buildJobs(cfg);
     if (!td || !jobs.length) { setStatus("Заполни дату и время в popup", "error"); return; }
+    // The opening time every gate below is measured against. A cfg saved before
+    // the setting existed has none and gets the default; an unreadable one must
+    // not quietly shoot at a time nobody chose.
+    var os = openSecFromCfg(cfg);
+    if (os < 0) { setStatus("Укажи время открытия слотов в popup", "error"); return; }
+    openSec = os;
+    log("opening time " + (cfg.openTime == null ? DEFAULT_OPEN_TIME + " (default)" : cfg.openTime) + " " + COURT_TZ);
     // Adding a profile blanks the identity fields, and the popup autosaves
     // that without touching `state` — so an armed run could reach Book with an
     // empty form (fillForm reports success for empty strings). Refuse instead.
@@ -1387,7 +1436,7 @@
     if (shotWindowPassed(td)) { await refuseOpenDate(cfg); return; }
     jobs.forEach(makeShots);
 
-    setStatus("Жду полночь " + shotNightLabel(td) + ": прямой запрос на " + jobTimes(jobs) + ", " + cfg.targetDate);
+    setStatus("Жду открытия " + shotNightLabel(td) + ": прямой запрос на " + jobTimes(jobs) + ", " + cfg.targetDate);
 
     var attempts = 0;
     var prepLead = directPrepLeadMs(jobs.length * SHOTS_PER_JOB);
@@ -1438,8 +1487,8 @@
           if (missing.length) setStatus("Не собрался прямой запрос для " + jobTimes(missing) +
                                         (retrying ? " — пробую ещё раз" : ""), "warn");
           else if (partial) setStatus("Выстрелы готовы не все (" + shotCounts(jobs) + ")" +
-                                      (retrying ? " — добираю" : " — жду полночь ⚡"), "warn");
-          else setStatus("Прямые запросы готовы (" + shotCounts(jobs) + ") — жду полночь ⚡", "ok");
+                                      (retrying ? " — добираю" : " — жду открытия ⚡"), "warn");
+          else setStatus("Прямые запросы готовы (" + shotCounts(jobs) + ") — жду открытия ⚡", "ok");
           parkedYmd = 0;                    // the sacrificial modal click moved focus
           continue;
         }
@@ -1517,7 +1566,7 @@
           // on its own — no post-detection redraw to wait out.
           if (!turboOn) {
             turboOn = true;
-            setStatus("Полночь близко — держу календарь горячим…");
+            setStatus("Открытие близко — держу календарь горячим…");
           }
           pokeApp(td);
           await sleep(TURBO_POKE_MS);
@@ -2007,7 +2056,7 @@
       var left = msToRollover();
       if (left > 0 && left < directPrepLeadMs(2 * SHOTS_PER_JOB) + 5000) {
         log("config changed close to the rollover — keeping the armed snapshot for tonight");
-        setStatus("Изменения применятся после полуночи — сейчас стреляю по старым настройкам", "warn");
+        setStatus("Изменения применятся после открытия — сейчас стреляю по старым настройкам", "warn");
         return;
       }
       runGen++;
