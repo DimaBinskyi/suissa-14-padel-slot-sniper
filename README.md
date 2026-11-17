@@ -5,9 +5,9 @@ booking page. It books a slot the moment it opens, in one of two modes picked
 in the popup (**«Способ брони»**):
 
 - **⚡ Прямой запрос** (direct shot, default) — at the moment a date opens
-  (the **opening time**, see below), it fires a salvo of three booking requests
-  it captured from the page itself ~30 s earlier: two just before the rollover,
-  one just after it.
+  (the **opening time**, see below), it fires a salvo of seven booking requests
+  it captured from the page itself ~50 s earlier: four before the rollover,
+  three after it.
 - **🖱 Через интерфейс** (UI) — a replay radar watches availability and, the
   moment the slot appears, books it through the page's own form (~0.5 s after
   the rollover). It also catches a slot that frees up later (a cancellation),
@@ -89,7 +89,8 @@ While armed:
      headers alone gave ±73–97 ms. If that endpoint is unreachable, the `Date`
      headers carry on alone. Midnight is scheduled on the estimate, not on the
      Mac's clock.
-   - **Capture (T−30 s, +5 s per extra capture)** — three captures per slot,
+   - **Capture (T−20 s, +5 s per extra capture: T−50 s for one slot, T−85 s
+     for two)** — seven captures per slot,
      one per shot (a token is spent by the first request carrying it — reusing
      one gets `400 ["recaptcha","DUPE"]`). Each opens the booking modal on any
      *currently open* (sacrificial) slot, fills the real data, and clicks
@@ -103,22 +104,33 @@ While armed:
    - **Retarget** — the sacrificial slot's epochs (ms and seconds forms,
      digit-boundary-safe, single pass) and `YYYYMMDD` are rewritten to the
      target. Any sacrificial id left in the body aborts that shot.
-   - **Fire — the salvo** — per slot: shot 1 at corrected midnight −100 ms,
-     shot 2 at −50 ms, shot 3 (the **safe** shot) at + the clock's ± bound
-     + 15 ms (at most 120 ms; 120 with no clock samples), which can't arrive
-     early even in the worst case inside the bound. The early shots bet on how
-     the server works (measured 2026-10-26): it assesses the reCAPTCHA token
-     *before* it looks at the slot, and the request needs ~20 ms to reach
-     Google — so a shot that leaves a little early can still meet an open slot,
-     ahead of everything sent at midnight. Too early costs only its own token
-     (`404`, the same answer as "taken"). With fewer shots prepared, the safe
-     moment is taken first: one shot fires exactly where the old single shot
-     did. Shots of different slots with the same offset leave in one timer tick.
+   - **Fire — the salvo** (`SHOT_PLAN`) — per slot, against corrected
+     midnight: **−700, −500, −300, −150 ms**, then the **safe** shot at + the
+     clock's ± bound + 15 ms (at most 120 ms; 120 with no clock samples), which
+     can't arrive early even in the worst case inside the bound, then **+80
+     and +160 ms after the safe shot** (≈ +40, +120, +200 ms on a good clock
+     night). Two bets around the safe shot, because the 2026-11-15 loss can be
+     read both ways (`-99/-49/+41 ms` all got `404`, while 19:00 was still
+     listed free until ≥ +0.40 s):
+     - *early* shots bet that the server decides long after a request arrives
+       (it assesses the reCAPTCHA token *before* it looks at the slot —
+       measured 2026-10-26 — and rush-time `404`s took 0.8–1.1 s vs 0.3 s on a
+       calm night), so a rival who sends earlier gets in the queue first;
+     - *late* shots bet that the booking side opens slightly after
+       22:00:00.000 (the list only bracketed the opening to −0.30…+0.19 s), so
+       everything at −0.1…+0.04 s was simply early.
+     A shot on the wrong side of its bet costs only its own token (`404`, the
+     same answer as "taken"). With fewer shots prepared, the first ones in
+     priority order fire — safe, +80, −300, +160, −500, −150, −700 — so one
+     shot fires exactly where the old single shot did. Shots of different slots with
+     the same offset leave in one timer tick.
    - **Warm-up + race log** — one availability replay at T−2.5 s keeps the
      connection to `calendar-pa` open (the clock probes talk to another server).
      From T−0.3 s to T+1.5 s availability is replayed back to back; the report
-     says when the day appeared and until when the slot was listed — the only
-     way to tell an early miss from a late one, since both are `404`.
+     says when the day appeared, until when the slot was listed, and (`слоты:`)
+     which times were listed at the opening and between which two replays each
+     one went — the only way to tell an early miss from a late one, since both
+     are `404`, and to see what the rivals take and how fast.
    - **Report** — a 200 counts as a win only once an availability replay shows
      the slot gone. Each slot's verdict (from a shot that got 200, else the safe
      shot), every shot's send time and HTTP status, the race note and the
@@ -166,7 +178,8 @@ midnight, each with its own profile. A rollover opens exactly one new day, so
 both jobs share the date.
 
 - **Direct mode** — captures are sequential (one modal in the DOM, and a
-  reCAPTCHA token is single-use): six for two slots, starting at `T−45 s`. At
+  reCAPTCHA token is single-use): fourteen for two slots, starting at `T−85 s`,
+  so the oldest token is ~80 s old at the shot (they live ~2 min). At
   the rollover both slots' salvos leave together, shot by shot.
 - **UI mode** — one modal at a time, but a job hands off as soon as its
   request is **sent** rather than when it completes, so the next slot's modal
@@ -200,13 +213,14 @@ tab is running (`Вкладка календаря: v0.5.1 ✓`). If they differ
    opens at the coming opening time, i.e. today + 2 before today's opening
    time), **Время открытия слотов** (default 22:00, Madrid), **Время** and the
    profile(s).
-3. Click **Включить ожидание** any time before ~T−1 min (captures start at T−30 s, T−45 s for two slots).
+3. Click **Включить ожидание** any time before ~T−2 min (captures start at T−50 s, T−85 s for two slots).
 4. Direct mode: after the shot you get a notification and a per-slot report in
    the popup, e.g.
    ```
-   ❌ 19:00 (Dmytro): слот заняли раньше нас (HTTP 404, отправлен T-0.044s, ответ за 740мс, выстрел 3 из 3): …
-      выстрелы (от полуночи сервера): T-0.100s 404 · T-0.050s 404 · T+0.036s 404
-      гонка: день открылся между T-0.038s и T+0.067s, 19:00 ни разу не был в списке
+   ❌ 19:00 (Dmytro): слот заняли раньше нас (HTTP 404, отправлен T-0.062s, ответ за 1059мс, выстрел 5 из 7): …
+      выстрелы (от полуночи сервера): T-0.700s 404 · T-0.500s 404 · T-0.300s 404 · T-0.150s 404 · T+0.041s 404 · T+0.121s 404 · T+0.201s 404
+      гонка: день открылся между T-0.298s и T+0.194s, 19:00 был в списке до T+0.398s, пропал к T+0.842s
+      слоты: при открытии 08:30 10:00 11:30 13:00 14:30 16:00 17:30 19:00 20:30; 20:30 занят T-0.082s…T+0.398s; 19:00 занят T+0.398s…T+0.842s
    ```
    UI mode: a notification per slot (`✅ Слот 20:30 (Pavlo) забронирован!`,
    `перехватили раньше нас`, `КАПЧА — нужен ты…`) and a summary for two slots.
@@ -214,7 +228,8 @@ tab is running (`Вкладка календаря: v0.5.1 ✓`). If they differ
 `отправлен T+…` is measured against midnight on **this Mac's** clock, not the
 corrected estimate. The Mac's clock is itself off by up to ~0.1 s (sntp measured
 it 59–109 ms slow on 2026-10-08), so compare it together with `clockOffsetMs`.
-The `выстрелы` and `гонка` lines are against the **corrected** midnight.
+The `выстрелы`, `гонка` and `слоты` lines are against the **corrected** midnight.
+The verdict line cites the safe shot unless some shot got `200`.
 
 ## One thread (why the fire path looks the way it does)
 
@@ -226,7 +241,7 @@ next, so the only thing that can cost the race is delaying the *moment*
 - **`inject.js` owns the fire timers.** `content.js` sends `arm-fire` with a
   plan of absolute deadlines ~6 s ahead, one timer per shot moment; a "fire
   now" `postMessage` would cost an event-loop turn, and one timer spinning
-  through all of them would hold the thread for ~150 ms.
+  through all of them would hold the thread for ~0.9 s.
 - **A 6 ms busy-wait tail** absorbs timer lateness.
 - **No DOM work within ±10 s of the rollover** in direct mode (parking and
   refetching stand still). UI mode is the opposite by design: its turbo window
@@ -273,10 +288,10 @@ the court's midnight (`T-12.345s` / `T+0.150s`).
 | `[padel popup …]` | popup (right-click the popup → Inspect) |
 | `[padel bg …]` | notifications (`chrome://extensions` → *service worker*) |
 
-Key lines on a live night: `engine v0.7.0 loaded`, `booking mode: …`, `opening time 22:00 Europe/Madrid`,
+Key lines on a live night: `engine v0.8.0 loaded`, `booking mode: …`, `opening time 22:00 Europe/Madrid`,
 `clock sync: server offset … ms clock …`, then in direct mode `booking request CAPTURED`,
 `prepare-direct[a1]: OK, replacements per pattern = …`,
-`midnight salvo scheduled, …: [a1,b1] T-0.100s, [a2,b2] T-0.050s, [a3,b3] T+0.036s`,
+`midnight salvo scheduled, …: [a1,b1] T-0.700s, [a2,b2] T-0.500s, [a3,b3] T-0.300s, [a4,b4] T-0.150s, [a5,b5] T+0.040s, [a6,b6] T+0.120s, [a7,b7] T+0.200s`,
 `fire[a1] <- 200 in 495ms`, `race log …`, and
 `verify 20:30 (Pavlo): http=200 verified=true slotStillOpen=false -> won`.
 

@@ -22,14 +22,15 @@
 //            own or a replayed one) is checked the moment it arrives.
 //   armed, mode "direct" -> wait for the midnight rollover that opens the
 //            target date, then:
-//            * ~30s before server-corrected midnight, capture the page's own
-//              booking request three times per job (one per shot): fill the
+//            * ~50s before server-corrected midnight, capture the page's own
+//              booking request seven times per job (one per shot): fill the
 //              form on a SACRIFICIAL open slot, click Book, and let inject.js
 //              swallow the request before it reaches the network. It carries
 //              the reCAPTCHA token the page just minted; its slot epochs are
 //              rewritten to the target;
-//            * fire the salvo from inject.js's own timers: two shots just
-//              before corrected midnight, the safe one just after it;
+//            * fire the salvo from inject.js's own timers: four shots before
+//              corrected midnight, the safe one just after it, two more after
+//              that (see SHOT_PLAN);
 //            * keep a race log of the availability list around the rollover,
 //              read every shot's HTTP result, check availability to confirm,
 //              persist the outcome (status + lastShot) and disarm.
@@ -979,22 +980,43 @@
     return Math.min(DIRECT_SEND_DELAY_MS, spread + DIRECT_SEND_MARGIN_MS);
   }
   // The salvo. Every slot gets SHOTS_PER_JOB shots, each carrying its own
-  // token: a token is spent by the first request that carries it. The LAST
-  // shot is the safe one, fired directSendDelayMs() after corrected midnight
-  // so it cannot arrive early — the v0.5.1 single shot. The others leave
-  // BEFORE midnight, at these offsets. Why that can win: the server assesses
-  // the reCAPTCHA token before it looks at the slot (an early request still
-  // burns its token — measured 2026-10-26), and the request needs ~20ms to
-  // reach Google, so a shot that leaves a little early can still meet an open
-  // slot, ahead of everything sent at midnight. One that is too early gets
-  // 404 and costs nothing but its own token.
+  // token: a token is spent by the first request that carries it. One shot is
+  // the SAFE one, fired directSendDelayMs() after corrected midnight so it
+  // cannot arrive early — the v0.5.1 single shot. Around it, two bets:
   //
-  // When fewer shots got prepared, the safe offset is assigned first: a lone
-  // shot fires exactly where the v0.5.1 single shot did.
-  var DIRECT_EARLY_SHOTS_MS = [-100, -50];
-  var SHOTS_PER_JOB = DIRECT_EARLY_SHOTS_MS.length + 1;
+  //  - EARLY shots (`early`, ms vs corrected midnight) bet that the server
+  //    looks at the slot only after a long assessment. It burns an early
+  //    request's token anyway (measured 2026-10-26), and on 2026-11-15 19:00
+  //    was still listed free ~0.35s after our +41ms shot had reached Google,
+  //    which still lost — 404s took 0.8-1.1s at the rush vs 0.3s on a calm
+  //    night. So the queue may decide, and a rival entered it before us.
+  //  - LATE shots (`late`, ms AFTER the safe shot) bet the opposite: that the
+  //    booking side opens a little later than 22:00:00.000. The list only
+  //    bracketed the opening to [-298, +194]ms that night, so all three shots
+  //    (-99/-49/+41) may simply have been early.
+  //
+  // A shot on the wrong side of its bet gets 404 and costs nothing but its
+  // own token. Listed in PRIORITY order: with only n tokens captured, the
+  // first n entries fire, so a lone shot fires exactly where the v0.5.1
+  // single shot did.
+  var SHOT_PLAN = [
+    { late: 0 },        // the safe shot
+    { late: 80 },
+    { early: -300 },
+    { late: 160 },
+    { early: -500 },
+    { early: -150 },
+    { early: -700 }
+  ];
+  var SHOTS_PER_JOB = SHOT_PLAN.length;
+  // The fire offsets (ms vs corrected midnight) for n prepared shots, in time
+  // order. `late` is the delay AFTER the safe moment, so it stays after it
+  // whatever the send delay comes out at.
   function shotOffsetsMs(n, sendDelay) {
-    return DIRECT_EARLY_SHOTS_MS.slice(DIRECT_EARLY_SHOTS_MS.length - (n - 1)).concat([sendDelay]);
+    return SHOT_PLAN.slice(0, n).map(function (p) {
+      return p.late != null ? { offMs: sendDelay + p.late, late: p.late, safe: p.late === 0 }
+                            : { offMs: p.early, late: null, safe: false };
+    }).sort(function (a, b) { return a.offMs - b.offMs; });
   }
   // One availability replay this long before the rollover keeps the page's
   // connection to calendar-pa open for the shots. The clock probes talk to
@@ -1147,7 +1169,7 @@
   function preparedShots(job) {
     return (job.shots || []).filter(function (s) { return s.prepared; });
   }
-  // "19:00 (Dmytro) 3/3 + 20:30 (Pavlo) 2/3"
+  // "19:00 (Dmytro) 7/7 + 20:30 (Pavlo) 5/7"
   function shotCounts(jobs) {
     return jobs.map(function (j) { return j.label + " " + preparedShots(j).length + "/" + SHOTS_PER_JOB; }).join(" + ");
   }
@@ -1183,16 +1205,17 @@
     // header estimate itself drifts by 100ms+ from night to night.
     var wallMidnightAt = midnightAt + offset;
 
-    // Each slot's prepared shots, in capture order, take the salvo's offsets:
-    // the last one the safe moment, the ones before it the early offsets.
+    // Each slot's prepared shots, in capture order, take the salvo's offsets in
+    // time order (see SHOT_PLAN). The safe shot and the late ones hang off
+    // fireAt, so a rollover that already passed still spaces them out.
     var shots = [];
     armed.forEach(function (j) {
       var ps = preparedShots(j);
       var offs = shotOffsetsMs(ps.length, sendDelay);
       ps.forEach(function (sh, i) {
-        var safe = (i === ps.length - 1);
-        shots.push({ job: j, shot: sh, offMs: offs[i], safe: safe,
-                     at: safe ? fireAt : Math.max(Date.now(), midnightAt + offs[i]) });
+        var o = offs[i];
+        shots.push({ job: j, shot: sh, offMs: o.offMs, safe: o.safe,
+                     at: o.late != null ? fireAt + o.late : Math.max(Date.now(), midnightAt + o.offMs) });
       });
     });
     // One timer per moment: shots of different slots sharing an offset leave
@@ -1260,7 +1283,7 @@
       var hits = mine.filter(function (x) { return x.res && x.res.status === 200; });
       // The job's verdict comes from a 200 if any shot got one, otherwise
       // from the safe shot — with one shot, that is the shot.
-      var best = hits[0] || mine[mine.length - 1];
+      var best = hits[0] || mine.filter(function (x) { return x.safe; })[0] || mine[mine.length - 1];
       var s = { job: j, res: best.res };
       var r = s.res || {};
       var http = r.status || 0;
@@ -1318,6 +1341,8 @@
       lines.push("❌ " + j.label + ": прямой запрос не был подготовлен");
       report.push({ job: j.label, verdict: "unprepared" });
     });
+    var slotsNote = raceSlotsNote(raceRows);
+    if (slotsNote) lines.push("   " + slotsNote);
 
     var won = report.filter(function (x) { return x.verdict === "won"; }).length;
     var maybe = report.some(function (x) { return x.http === 200; });
@@ -1329,7 +1354,7 @@
       clockSpreadMs: spread, clockAgree: clockFix.agree, sendDelayMs: sendDelay,
       clockMs: msClockBest ? { off: Math.round(msClockBest.off), rtt: msClockBest.rtt } : null,
       shotOffsetsMs: shots.map(function (x) { return x.shot.id + ":" + Math.round(x.at - midnightAt); }),
-      race: raceRows.slice(0, 40),
+      race: raceRows.slice(0, 40), raceSlots: slotsNote,
       verified: verified, jobs: report
     } });
     notify(won === jobs.length ? "✅ Padel забронирован" : "Padel: результат выстрела", lines.join("\n"), true);
@@ -1343,7 +1368,9 @@
 
   // What the availability list showed around the rollover. Per replay: when
   // it left and came back (ms vs corrected midnight), how many of the target
-  // day's slots it listed, and which of our slots were among them.
+  // day's slots it listed, which of our slots were among them, and the listed
+  // times themselves (`t`, court time) — which slot went when, i.e. what the
+  // rivals take and how fast.
   function summarizeRace(samples, td, jobs, midnightAt) {
     var dayStart = parseInt(targetEpochCandidates(td, 0)[1], 10);   // court 00:00 as unix seconds
     return (samples || []).map(function (x) {
@@ -1352,11 +1379,42 @@
         if (+sec >= dayStart && +sec < dayStart + 86400) seen[sec] = true;
         return m;
       });
+      var secs = Object.keys(seen).map(Number).sort(function (a, b) { return a - b; });
       var row = { s: Math.round(x.tSent - midnightAt), r: Math.round(x.tRecv - midnightAt),
-                  http: x.status || 0, day: Object.keys(seen).length, has: [] };
+                  http: x.status || 0, day: secs.length, has: [], t: secs.map(courtHhmm) };
       jobs.forEach(function (j) { if (x.body && bodiesContainTarget([x.body], td, j.timeMin)) row.has.push(j.id); });
       return row;
     });
+  }
+  // Unix seconds -> "19:00" on the court's clock.
+  function courtHhmm(sec) {
+    var p = {};
+    FMT_MINUTE.formatToParts(new Date(sec * 1000)).forEach(function (x) { p[x.type] = x.value; });
+    return (p.hour === "24" ? "00" : p.hour) + ":" + p.minute;
+  }
+  // The whole day's timeline in one line: what was listed when the day
+  // opened, then every time that went (or came back) and between which two
+  // replays. A replay with no slots at all after the opening is treated as a
+  // failed one, not as "everything got booked".
+  //   "слоты: при открытии 08:30 … 20:30; 20:30 занят T-0.082s…T+0.398s; 19:00 занят T+0.398s…T+0.842s"
+  function raceSlotsNote(rows) {
+    var prev = null, parts = [];
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      if (!row.day || !row.t) continue;
+      if (!prev) {
+        parts.push("при открытии " + row.t.join(" "));
+      } else {
+        prev.t.forEach(function (x) {
+          if (row.t.indexOf(x) === -1) parts.push(x + " занят " + fmtT(prev.s) + "…" + fmtT(row.r));
+        });
+        row.t.forEach(function (x) {
+          if (prev.t.indexOf(x) === -1) parts.push(x + " снова свободен " + fmtT(prev.s) + "…" + fmtT(row.r));
+        });
+      }
+      prev = row;
+    }
+    return parts.length ? "слоты: " + parts.join("; ") : "";
   }
   // A replay is answered somewhere between leaving and coming back, so every
   // moment here is a bracket, not a point.

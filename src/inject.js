@@ -42,7 +42,7 @@
   // kept as bookingTemplate. prepare-direct rewrites its slot epochs into
   // prepared[id], which direct-book fires verbatim at midnight.
   //
-  // prepared is keyed by SHOT id ("a1".."a3", "b1".."b3") so several shots per
+  // prepared is keyed by SHOT id ("a1".."a7", "b1".."b7") so several shots per
   // slot, and several slots, can be armed at once. Each comes from its own
   // capture: a token is spent by the first request that carries it, even one
   // the server turns away as not-open-yet — reusing it gets
