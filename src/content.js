@@ -218,11 +218,19 @@
   // ---------- time / date ----------
   function pad(n) { return (n < 10 ? "0" : "") + n; }
   function slotTextToMinutes(txt) {
-    var m = String(txt).trim().toLowerCase().match(/^(\d{1,2}):(\d{2})\s*(am|pm)$/);
+    // Google Calendar now renders appointment buttons in 24-hour form (e.g.
+    // "16:00"). Keep accepting the older 12-hour form for other locales.
+    var value = String(txt).trim().toLowerCase();
+    var m = value.match(/^(\d{1,2}):(\d{2})\s*(am|pm)?$/);
     if (!m) return -1;
-    var h = parseInt(m[1], 10) % 12;
-    if (m[3] === "pm") h += 12;
-    return h * 60 + parseInt(m[2], 10);
+    var h = parseInt(m[1], 10), minute = parseInt(m[2], 10);
+    if (minute > 59) return -1;
+    if (m[3]) {
+      if (h < 1 || h > 12) return -1;
+      h = h % 12;
+      if (m[3] === "pm") h += 12;
+    } else if (h > 23) return -1;
+    return h * 60 + minute;
   }
   function hhmmToMinutes(txt) {
     var m = String(txt).trim().match(/^(\d{1,2}):(\d{2})$/);
@@ -565,7 +573,7 @@
     var btns = document.querySelectorAll("button");
     for (var i = 0; i < btns.length; i++) {
       var t = (btns[i].textContent || "").trim();
-      if (/^\d{1,2}:\d{2}(am|pm)$/i.test(t) && visible(btns[i])) out.push(btns[i]);
+      if (/^\d{1,2}:\d{2}\s*(am|pm)?$/i.test(t) && visible(btns[i]) && slotTextToMinutes(t) >= 0) out.push(btns[i]);
     }
     return out;
   }
